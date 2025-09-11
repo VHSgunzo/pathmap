@@ -48,23 +48,47 @@ The path mapping works by intercepting standard library functions which have a p
 If this argument matches the given prefix (the first part) of the mapping, the prefix is replaced by the destination (the second part) of the mapping.
 Then the original standard library function is called with this possibly modified path.
 
-Most Linux `libc` functions that do something with files are supported (except those that I forgot).
-The actual list of functions is quite long and can be looked up in the code.
-However, even if all functions with a `path` argument are overloaded, there are some pitfalls.
-See below under **Potential problems** for more information.
+- Relative paths are now supported: before matching, paths are normalized by resolving `.` and `..` and by anchoring relative paths to the process CWD (for `*at` functions: to the directory identified by `dirfd`).
+- Reverse mapping for `getcwd` family: `getcwd`, `get_current_dir_name` and `getwd` will translate the real current directory back into the virtual path when applicable.
+- `*at` functions: when the path is relative, the library resolves `dirfd` via `/proc/self/fd/<dirfd>` to compute an absolute path and then applies mapping.
+
+Most Linux `libc` functions that operate on paths are supported, including many GNU and Linux-specific variants. The list is long (see code), covering e.g. `open*`, `stat*`, `exec*`, `scandir*`, `glob*`, xattr, `link*`, `rename*`, `mkdir*`, `mk*temp`, mount-related syscalls, inotify/fanotify, and more. Some exotic or deprecated variants are compiled conditionally under `__GLIBC__` for musl compatibility.
 
 ## Path mapping configuration
 
 There are two ways to specify the path mappings. An arbitrary number of mappings can be used at once.
 
-1. If the environment variable `PATH_MAPPING` exists, path-mapping.so will try to initialize the mappins from there.
-   The first part of each pair is the prefix, and the second part is the destination, so the number of given paths must be even.
-   All parts are separated by colons:
+1. If the environment variable `PATH_MAPPING` exists, path-mapping.so will try to initialize the mappings from there.
+   Use `:` to separate elements within a pair and `,` to separate pairs: `FROM1:TO1,FROM2:TO2,...`.
    ```bash
-   export PATH_MAPPING="/usr/virtual1:/map/dest1:/usr/virtual2:/map/dest2"
+   export PATH_MAPPING="/usr/virtual1:/map/dest1,/usr/virtual2:/map/dest2"
    ```
 
+### Excluding paths from mapping
+
+Both LD_PRELOAD library and the `pathmap` tracer support exclusions via a comma-separated list of absolute prefixes in the environment variable `PATH_MAPPING_EXCLUDE`.
+
+Behavior:
+- If a path (after normalization and relative resolution) starts with any excluded prefix, forward mapping is skipped.
+- Reverse mapping (for outputs like `getcwd`, `readlink*`, directory entry names) will also be skipped if the result would fall under an excluded prefix.
+
+Examples:
+```bash
+# Do not remap NSS critical files while remapping everything else under /etc and /dev
+export PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev"
+export PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf"
+
+# Using the tracer
+PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf" \
+  PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev" ./pathmap bash
+
+# Using the LD_PRELOAD library
+PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf" \
+  PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev" LD_PRELOAD=./path-mapping.so bash
+```
+
 2. If `PATH_MAPPING` is unset or empty, the mapping specified in the variable `default_path_map` will be used instead.
+   The `pathmap` tracer mirrors this behavior with the same built-in default pair, so both tools behave consistently without `PATH_MAPPING`.
    You can modify it if you don't want to set `PATH_MAPPING`, for example like this:
    ```C
    static const char *default_path_map[][2] = {
@@ -75,13 +99,7 @@ There are two ways to specify the path mappings. An arbitrary number of mappings
 
 ## Compiling and installation
 
-Just run `make all` to compile the different versions of the library:
-* `path-mapping-quiet.so` is compiled with `#define QUIET`.
-  It will not print anything, except in case of a fatal configuration error, before stopping the process.
-* `path-mapping.so` will print out a diagnostig string to stderr when a path is mapped to a new destination.
-* `path-mapping-debug.so` is compiled with `#define DEBUG`.
-  It will will additionally print out one line for each function call to any overridden function.
-  This is very slow and noisy. Only use it to determine which paths need overriding.
+Just run `make` to build the library and tracer.
 
 Choose one of those files and place it anywhere convenient.
 Note its absolute path and provide it to the target program as `LD_PRELOAD`, for example:
@@ -102,19 +120,38 @@ LD_PRELOAD=$HOME/repos/ld-preload-open/path-mapping.so /bin/ls /somewhere
 ```
 
 
-## Compile time options
+### Building with musl or glibc
 
-There some options which can be set during compile time by defining some preprocessor macros.
-For example, adding `#define QUIET` or compiling with `-DQUIET` will remove all informational printf commands.
+This project supports building against both glibc and musl.
 
-Normally, the loaded path mapping will be printed to `stderr` at startup, and an info message will be printed to `stderr` each time a path mapping is applied.
+- glibc (default):
+  ```bash
+  make
+  ```
+- musl:
+  ```bash
+  CC=musl-gcc make
+  ```
 
-* `QUIET`: Removes all `info_fprintf` commands.
-  The resulting `path-mapping.so` will not print anything, except for initialization errors which will `exit()` the program immediately.
-* `DEBUG`: Enables all `debug_fprintf` calls.
-  This will print additional output to `stderr` each time an overloaded functions called, including the path argument(s).
-* `DISABLE_*`: These options allow you to disable the overloading of some specific functions if you desire.
-  See the code in `path-mapping.c` for a complete list.
+Notes:
+- Some GNU-only wrappers are compiled only when `__GLIBC__` is present (e.g., certain `__xstat*`, FTW, some 64-bit legacy aliases). Feature parity for core functionality is maintained on both libcs.
+- If you see benign warnings about discarded qualifiers for `mk*temp` family, they can be ignored; the templates are copied internally.
+
+## Runtime logging control (LD_PRELOAD library)
+
+Use the environment variable `PATHMAP_DEBUG` to control logging verbosity at runtime:
+
+- `PATHMAP_DEBUG=0` (default): quiet mode; no info/debug logs
+- `PATHMAP_DEBUG=1`: info logs (e.g., mapping pairs at startup, mapped path notifications)
+- `PATHMAP_DEBUG=2`: debug logs (includes info plus per-call traces of overridden functions)
+
+Example:
+```bash
+PATHMAP_DEBUG=1 PATH_MAPPING="/etc:/tmp/etc" LD_PRELOAD=./path-mapping.so cmd
+PATHMAP_DEBUG=2 PATH_MAPPING="/etc:/tmp/etc" LD_PRELOAD=./path-mapping.so cmd
+```
+
+Compile-time `DISABLE_*` macros are supported to exclude specific overrides. See `path-mapping.c` for available flags.
 
 ## Tests
 
@@ -127,20 +164,12 @@ On first glance, this library might look like it can be used as a replacement fo
 However, since this is quite a hacky solution that runs only in user space, there are some issues where things do not work quite as one would expect.
 Some of these could be fixed or worked around, but in some cases that would require significantly more work than just overloading a few functions.
 
-1. Only absolute paths are currently mapped, relative paths are not.
-   If a program does `open("/usr/virtual1/file")`, it will be mapped to `/map/dest1/file`, but `chdir("/usr")` followed by `open("virtual1/file")` will fail with `ENOENT`.
-
-   The same problem applies to functions ending in `at`, like `openat`.
-   These functions have a parameter `int dirfd`, relative to which the `path` argument is searched (if it is not an absolute path).
-   This library makes no attempt to find out the path of the directory which `dirfd` represents.
-2. Return values from standard library functions are not mapped.
-   For example, `getcwd()` will return `/map/dest1` after a calling `chdir("/usr/virtual1")` (from the example above).
-
-   However, this is usually not be a problem, because the program can then internally use that existing path for all future accesses, which will succeed as expected.
-   Even an interactive `bash` session can work (to a certain extent) inside virtual mapped directories.
-3. Virtual mapped entries do not appear in directory listings.
+1. Return values from standard library functions are not mapped universally.
+   Only `getcwd` family is reverse-mapped in the LD_PRELOAD library. The `ptrace` tracer augments this by reverse-mapping `readlink/readlinkat` outputs and directory entries (`getdents`/`getdents64`) when feasible (name not longer than the original buffer space), and by reverse-mapping `getcwd`.
+3. Virtual mapped entries do not appear in directory listings (LD_PRELOAD).
    The example mapping for `/usr/virtual1` will not show up in `ls /usr` or `find /usr`.
-4. Symlinks that point into virtual directories will not work, because symlinks are evaluated by the kernel, not in user space.
+   The `ptrace` tracer partially mitigates this by post-processing `getdents` buffers and renaming `d_name` in-place if the new name is not longer than the old one.
+4. Symlinks that point into virtual directories will not work with LD_PRELOAD, because symlinks are evaluated by the kernel, not in user space.
    For example, the following will fail:
    ```bash
    export PATH_MAPPING=/tmp/virtual:/tmp/real
@@ -166,8 +195,52 @@ Some of these could be fixed or worked around, but in some cases that would requ
    In this case, the path mapping will not work.
 7. If a standard library function internally calls an overloaded function like `stat` or `open`, then `LD_PRELOAD` can not intercept that.
 8. If internal workings of the libc change in the future, a program might just stop working.
-9. Path mapping does not work if a program talks to the kernel directly using syscalls (which would be *very* bad practice) instead of using the `libc` functions to make the syscalls for it.
-   Or if a program uses a different standard library, which does syscalls directly instead of falling back to the standard `libc` functions (not sure if something like that exists in practice).
+9. Path mapping does not work if a program talks to the kernel directly using syscalls instead of going through `libc` wrappers, or for statically linked binaries. `LD_PRELOAD` is ineffective for static binaries (e.g., some `ldconfig` builds). Use the `ptrace` tracer below for such cases.
+
+## Developer notes
+- A ptrace-based tracer `pathmap` is provided to support static binaries. It rewrites path arguments of selected syscalls, with safe in-place writes or stack-based remapped buffers when the mapped path is longer.
+
+## PTrace tracer (static binaries)
+
+Build (x86_64 default, supports aarch64 and riscv64 via cross-compiling toolchains):
+```bash
+make pathmap           # dynamic
+make pathmap-static    # static
+make pathmap-static-pie
+```
+
+Usage:
+```bash
+PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev" ./pathmap --debug /bin/ldconfig
+PATH_MAPPING="/etc:/tmp/etc" ./pathmap --exclude "/etc/passwd,/etc/group,/etc/nsswitch.conf" bash
+./pathmap --help
+```
+
+Details:
+- Architectures: x86_64, aarch64 (ARM64), riscv64 (via ptrace GETREGS/GETREGSET abstraction).
+- Intercepts and remaps many path-taking syscalls pre-call: `open`, `openat`, `newfstatat`, `unlinkat`, `execve`, `statx`, `rename*`, `link*`, `mkdir*`, `mknod*`, `mkfifo*`, `chmod`, `lchown`, `fchownat`, `utimensat`, `access`, `faccessat`, `open_tree`, `move_mount`.
+- Reverse mapping post-call: `getcwd`, `readlink/readlinkat` (adjusts return length if truncated), `getdents/getdents64` (in-place rename when new name fits).
+- Relative paths are resolved in the tracee context (CWD or `dirfd` via `/proc/<pid>/fd/<fd>`), then normalized and mapped.
+- Longer mapped paths are handled using safe stack-based placement in the tracee, with register arguments updated accordingly.
+- Multi-process/thread: follows `fork`/`vfork`/`clone`/`exec`.
+- CLI and env:
+  - `-p, --path-mapping FROM:TO[,FROM:TO...]` (overrides `PATH_MAPPING`)
+  - `-x, --exclude PREFIX[,PREFIX...]` (overrides `PATH_MAPPING_EXCLUDE`)
+  - `-d, --debug` or `PATHMAP_DEBUG=1` for verbose logs
+  - `-r, --dry-run` to log without modifying the tracee
+  - `-h, --help`, `-v, --version`
+
+Defaults and logging:
+- If `PATH_MAPPING` is unset/empty, `pathmap` uses the same built-in default mapping as the LD_PRELOAD library.
+- If `PATH_MAPPING_EXCLUDE`/`--exclude` are not provided, both tools apply default exclusions: `/etc/passwd,/etc/group,/etc/nsswitch.conf`.
+- With debug enabled, `pathmap` prints which syscall triggered a remap, e.g. `[pathmap] map openat2: '/etc/ld.so.cache' -> '/tmp/etc/ld.so.cache'`.
+
+Limitations:
+- Some syscalls or ioctl paths not explicitly handled may still bypass mapping.
+- For `getdents*`, reverse rename is only applied if the new name is not longer than the original entry; otherwise original names remain.
+- For `readlink*`, if the reverse-mapped path exceeds caller buffer, the result is truncated and return length adjusted accordingly.
+- On aarch64, changing the syscall number itself may require `NT_ARM_SYSTEM_CALL`; this tracer does not change syscall numbers, only arguments/returns for supported calls.
+- Security hardening like strict user namespaces is out of scope; prefer bind/overlay when available.
 
 ## License
 

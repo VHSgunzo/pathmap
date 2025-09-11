@@ -5,6 +5,9 @@ set -o errtrace # trap ERR in functions
 set -o errexit
 set -o nounset
 
+export LC_ALL=C
+export LANG=C
+
 lib="$PWD/path-mapping.so"
 testdir="${TESTDIR:-/tmp/path-mapping}"
 
