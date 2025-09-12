@@ -10,7 +10,13 @@ UNIT_TESTS = test-pathmatching test-common
 path-mapping.so: path-mapping.c
 	$(CC) $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
 
-all: path-mapping.so pathmap
+path-mapping-glibc.so: path-mapping.c
+	gcc $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
+
+path-mapping-musl.so: path-mapping.c
+	musl-gcc $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
+
+all: path-mapping.so pathmap path-mapping-glibc.so path-mapping-musl.so pathmap-static
 
 clean:
 	rm -f *.so pathmap pathmap-static*

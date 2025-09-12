@@ -1,5 +1,6 @@
-path-mapping.so
+path-mapping*.so
 pathmap
 pathmap-*
 .vscode
-
+AppDir
+squashfs-root

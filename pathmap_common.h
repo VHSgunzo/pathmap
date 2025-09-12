@@ -105,7 +105,8 @@ static inline int pm_parse_path_mapping_env(const char *env,
 
     int idx = 0;
     char *pair_start = buf;
-    for (size_t i = 0; i <= strlen(buf); i++) {
+    size_t buf_len = strlen(buf);
+    for (size_t i = 0; i <= buf_len; i++) {
         if (buf[i] == ',' || buf[i] == '\0') {
             buf[i] = '\0'; // terminate current pair
             char *colon = strchr(pair_start, ':');
