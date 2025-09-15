@@ -3,12 +3,6 @@ This library can trick a process into opening absolute paths from a different lo
 The main difference that an affected process can (apparently) see and access files *inside* the virtual mapped directory, but cannot see the virtual directory *itself*.
 Also, in contrast to mounts, every process on a system can have its own mapping (disregarding mount namespaces in current kernels, which basically also require root access).
 
-> **WARNING:** This library is kind of a hack.
->
-> It works quite well, mostly, but unforseen side effects or crashes are totally possible (see **Potential problems** below).
->
-> **_DO NOT USE for mission critical software!_**
-
 ## Example 1
 
 One example are ["Environment Modules"](https://modules.readthedocs.io/en/latest/) which can be loaded with the command `module load` to activate some software in the current shell. If you have multiple versions of a software, which should be available side by side, you can use this library to trick them into loading version specific assets from a common absolute path.
