@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
     for (char **env = environ; *env != NULL; env++)
     {
         char *thisEnv = *env;
-        printf("%s\n", thisEnv);    
+        printf("%s\n", thisEnv);
     }
     return 0;
 }

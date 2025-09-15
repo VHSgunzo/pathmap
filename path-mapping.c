@@ -35,7 +35,7 @@ SOFTWARE.
 #include <sys/statvfs.h> // statvfs
 #include <sys/stat.h> // statx, chmod, chown, stat
 #include <unistd.h> // uid_t, gid_t
-#include <malloc.h> // for execl
+#include <stdlib.h>
 #include <utime.h> // utimebuf
 #include <sys/time.h> // struct timeval
 #include <sys/types.h> // dev_t
@@ -43,7 +43,6 @@ SOFTWARE.
 #ifdef __GLIBC__
 #include <fts.h> // fts (glibc-only)
 #endif
-#include <assert.h>
 #include "pathmap_common.h"
 #include <sys/xattr.h> // xattr APIs
 #include <glob.h> // glob
@@ -55,29 +54,14 @@ struct open_how;
 struct mount_attr;
 #include <mntent.h> // setmntent
 #include <errno.h> // errno, ERANGE
-#include <sys/inotify.h> // inotify_add_watch
+#include <sys/inotify.h>
 #include <sys/fanotify.h> // fanotify_mark
 
 
-// Runtime logging control via PATHMAP_DEBUG (0=off, 1=info, 2=debug)
-static int g_log_level = 0; // 0: quiet, 1: info, 2: debug
-
-__attribute__((constructor))
-static void debug_init()
-{
-    const char *env_debug = getenv("PATHMAP_DEBUG");
-    if (!env_debug || !*env_debug) { g_log_level = 0; return; }
-    if (strcmp(env_debug, "0") == 0) { g_log_level = 0; return; }
-    if (strcmp(env_debug, "1") == 0) { g_log_level = 1; return; }
-    // Any other non-zero value treated as full debug
-    g_log_level = 2;
-}
-
-// Runtime logging control
-#define info_fprintf(...)  do { if (g_log_level >= 1) fprintf(__VA_ARGS__); } while(0)
-#define debug_fprintf(...) do { if (g_log_level >= 2) fprintf(__VA_ARGS__); } while(0)
-
-#define error_fprintf fprintf // always print errors
+// Use common logging system from pathmap_common.h
+#define info_fprintf pm_info_fprintf
+#define debug_fprintf pm_debug_fprintf
+#define error_fprintf pm_error_fprintf
 
 // Enable or disable specific overrides (always includes different variants and the 64 version if applicable)
 // #define DISABLE_OPEN
@@ -123,29 +107,15 @@ static void debug_init()
 // #define DISABLE_STATMOUNT
 // #define DISABLE_INOTIFY
 // #define DISABLE_FANOTIFY
+// #define DISABLE_UMOUNT
 // #define DISABLE_PIVOT_ROOT
 
-// List of path pairs. Paths beginning with the first item will be
-// translated by replacing the matching part with the second item.
-static const char *default_path_map[][2] = {
-    { "/tmp/path-mapping/tests/virtual", "/tmp/path-mapping/tests/real" },
-};
-
-static const char *(*path_map)[2] = default_path_map;
-static int path_map_length = (sizeof default_path_map) / (sizeof default_path_map[0]);
+// Use common configuration structure
+static struct pm_common_config g_config;
+static const char *(*path_map)[2] = (const char *(*)[2])g_config.mapping_config.mappings;
+static int path_map_length = 0; // Will be set from g_config.mapping_config.mapping_count
 static char *path_map_buffer = NULL;
 static char **path_map_linear = NULL; // 2*N entries if env specified
-static const char *exclude_list[64];
-static int exclude_count = 0;
-static int exclude_is_malloced[64];
-
-// Default exclusions when PATH_MAPPING_EXCLUDE is not provided
-static const char *default_exclude_list[] = {
-    "/etc/passwd",
-    "/etc/group",
-    "/etc/nsswitch.conf",
-};
-static const int default_exclude_count = (sizeof default_exclude_list) / (sizeof default_exclude_list[0]);
 
 
 //////////////////////////////////////////////////////////
@@ -156,9 +126,13 @@ static const int default_exclude_count = (sizeof default_exclude_list) / (sizeof
 __attribute__((constructor))
 static void path_mapping_init()
 {
-    if (path_map != default_path_map) return;
+    // Initialize common configuration
+    pm_init_common_config(&g_config);
 
-    // If environment variable is set and non-empty, override the default
+    // Set up legacy variables for compatibility
+    path_map_length = (int)g_config.mapping_config.mapping_count;
+
+    // Handle legacy linear buffer for environment-based mappings
     const char *env_string = getenv("PATH_MAPPING");
     if (env_string != NULL && strlen(env_string) > 0) {
         int pairs_len = 0;
@@ -173,43 +147,9 @@ static void path_mapping_init()
             exit(255);
         }
         if (pairs_len > 0) {
-            path_map_length = pairs_len;
             path_map_linear = linear;
             path_map_buffer = buf;
             path_map = (const char *(*)[2])linear;
-        }
-    }
-
-    for (int i = 0; i < path_map_length; i++) {
-        info_fprintf(stderr, "PATH_MAPPING[%d]: %s => %s\n", i, path_map[i][0], path_map[i][1]);
-    }
-
-    // Load exclusions from PATH_MAPPING_EXCLUDE (colon-separated absolute prefixes)
-    const char *excl = getenv("PATH_MAPPING_EXCLUDE");
-    exclude_count = 0;
-    if (excl && *excl) {
-        const char *p = excl;
-        while (*p && exclude_count < (int)(sizeof exclude_list / sizeof exclude_list[0])) {
-            const char *start = p;
-            while (*p && *p != ',') p++;
-            size_t len = (size_t)(p - start);
-            if (len > 0) {
-                char *s = (char *)malloc(MAX_PATH);
-                if (!s) break;
-                size_t copy = len < (MAX_PATH - 1) ? len : (MAX_PATH - 1);
-                memcpy(s, start, copy); s[copy] = '\0';
-                pm_normalize_path_inplace(s);
-                exclude_list[exclude_count] = s;
-                exclude_is_malloced[exclude_count] = 1;
-                exclude_count++;
-            }
-            if (*p == ',') p++;
-        }
-    } else {
-        for (int i = 0; i < default_exclude_count && i < (int)(sizeof exclude_list / sizeof exclude_list[0]); i++) {
-            exclude_list[i] = default_exclude_list[i];
-            exclude_is_malloced[i] = 0;
-            exclude_count++;
         }
     }
 }
@@ -217,11 +157,11 @@ static void path_mapping_init()
 __attribute__((destructor))
 static void path_mapping_deinit()
 {
-    if (path_map != default_path_map) {
+    if (path_map_linear) {
         free(path_map_linear);
     }
     free(path_map_buffer);
-    for (int i = 0; i < exclude_count; i++) if (exclude_is_malloced[i]) free((void*)exclude_list[i]);
+    pm_cleanup_common_config(&g_config);
 }
 
 
@@ -230,57 +170,10 @@ static void path_mapping_deinit()
 /////////////////////////////////////////////////////////
 
 
-// pathlen/path_prefix_matches now provided by pathmap_common.h as pm_pathlen/pm_path_prefix_matches
-
-// Forward decl is now in pathmap_common.h (pm_normalize_path_inplace)
-
 // Check if path matches any defined prefix, and if so, replace it with its substitution
 static const char *fix_path(const char *function_name, const char *path, char *new_path, size_t new_path_size)
 {
-    if (path == NULL) return path;
-
-    // If relative, resolve against CWD and normalize .. and . components (without touching FS)
-    const char *match_path = path;
-    char absbuf[MAX_PATH];
-    if (path[0] != '/') {
-        // Build base
-        char base[MAX_PATH];
-        if (getcwd(base, sizeof base) == NULL) {
-            // Fallback: can't resolve, skip mapping
-            return path;
-        }
-        // Join base and path into absbuf
-        size_t bl = strlen(base);
-        absbuf[0] = '\0';
-        strncpy(absbuf, base, sizeof absbuf - 1);
-        absbuf[sizeof absbuf - 1] = '\0';
-        if (bl == 0 || absbuf[bl - 1] != '/') strncat(absbuf, "/", sizeof absbuf - strlen(absbuf) - 1);
-        strncat(absbuf, path, sizeof absbuf - strlen(absbuf) - 1);
-
-        // Normalize path
-        pm_normalize_path_inplace(absbuf);
-        match_path = absbuf;
-    } else {
-        // Normalize absolute path to collapse sequences like "/.//" so prefix match works
-        strncpy(absbuf, path, sizeof absbuf - 1);
-        absbuf[sizeof absbuf - 1] = '\0';
-        pm_normalize_path_inplace(absbuf);
-        match_path = absbuf;
-    }
-
-    // Exclusions: if match_path lies under any excluded prefix, skip mapping
-    for (int i = 0; i < exclude_count; i++) {
-        if (pm_path_prefix_matches(exclude_list[i], match_path)) {
-            debug_fprintf(stderr, "Excluded Path: %s('%s') under '%s'\n", function_name, match_path, exclude_list[i]);
-            return path;
-        }
-    }
-    const char *mapped = pm_apply_mapping_pairs(match_path, path_map, path_map_length, new_path, new_path_size);
-    if (mapped != match_path) {
-        info_fprintf(stderr, "Mapped Path: %s('%s') => '%s'\n", function_name, path, mapped);
-        return mapped;
-    }
-    return path;
+    return pm_fix_path_common(function_name, path, new_path, new_path_size, &g_config);
 }
 
 
@@ -289,28 +182,16 @@ static const char *reverse_fix_path(const char *function_name, const char *path,
 {
     if (path == NULL) return path;
 
-    // For reverse mapping, reuse pm_apply_mapping_pairs by swapping map order logically
-    for (int i = 0; i < path_map_length; i++) {
-        const char *tmp_pair[1][2] = { { path_map[i][1], path_map[i][0] } };
-        const char *mapped = pm_apply_mapping_pairs(path, (const char * (*)[2])tmp_pair, 1, new_path, new_path_size);
-        // If reverse-mapped path would fall into an excluded prefix, skip applying it
-        if (mapped != path) {
-            int excluded = 0;
-            for (int j = 0; j < exclude_count; j++) {
-                if (pm_path_prefix_matches(exclude_list[j], mapped)) { excluded = 1; break; }
-            }
-            if (excluded) return path;
-        }
-        if (mapped != path) {
-            info_fprintf(stderr, "Reverse-Mapped Path: %s('%s') => '%s'\n", function_name, path, mapped);
-            return mapped;
-        }
+    // For reverse mapping, use common function
+    const char *mapped = pm_apply_reverse_mapping_with_config(path, new_path, new_path_size, &g_config.mapping_config);
+    // If reverse-mapped path would fall into an excluded prefix, skip applying it
+    if (mapped != path) {
+        if (pm_is_excluded_prefix(mapped, &g_config.mapping_config)) return path;
+        info_fprintf(stderr, "Reverse-Mapped Path: %s('%s') => '%s'\n", function_name, path, mapped);
+        return mapped;
     }
     return path;
 }
-
-// Normalize absolute-like path string by collapsing //, /./, and /../ segments into buffer
-// normalize helper now provided by pathmap_common.h as pm_normalize_path_inplace
 
 
 // Join base directory (from dirfd or getcwd) with a possibly relative path
@@ -322,7 +203,9 @@ static const char *absolute_from_dirfd(int dirfd, const char *path, char *buffer
     char base[MAX_PATH];
     ssize_t n = 0;
     if (dirfd == AT_FDCWD) {
-        if (getcwd(base, sizeof base) == NULL) return path; // fallback
+        ssize_t n = readlink("/proc/self/cwd", base, sizeof base - 1);
+        if (n <= 0) return path; // fallback
+        base[n] = '\0';
     } else {
         char linkpath[64];
         snprintf(linkpath, sizeof linkpath, "/proc/self/fd/%d", dirfd);
@@ -346,9 +229,6 @@ static const char *absolute_from_dirfd(int dirfd, const char *path, char *buffer
 /////////////////////////////////////////////////////////
 
 
-// Hint for debugging these macros:
-// Remove the #define __NL__, then compile with gcc -save-temps.
-// Then open path-mapping.i with a text editor and replace __NL__ with newlines.
 #define __NL__
 
 // Select argument name i from the variable argument list (ignoring types)
@@ -417,10 +297,9 @@ __NL__    OVERRIDE_DO_MODE_VARARG(has_varargs, nargs, path_arg_pos, __VA_ARGS__)
 __NL__    return orig_func(OVERRIDE_RETURN_ARGS(nargs, path_arg_pos, __VA_ARGS__));\
 __NL__}
 
-// Conditionally expands to the code used to handle the mode argument of open() and openat()
 #define OVERRIDE_DO_MODE_VARARG(has_mode_vararg, nargs, path_arg_pos, ...) \
     OVERRIDE_DO_MODE_VARARG_##has_mode_vararg(nargs, path_arg_pos, __VA_ARGS__)
-#define OVERRIDE_DO_MODE_VARARG_0(nargs, path_arg_pos, ...) // Do nothing
+#define OVERRIDE_DO_MODE_VARARG_0(nargs, path_arg_pos, ...)
 #define OVERRIDE_DO_MODE_VARARG_1(nargs, path_arg_pos, ...) \
 __NL__    if ((flags & O_CREAT) != 0) {\
 __NL__        va_list args;\
@@ -704,21 +583,9 @@ char *getcwd(char *buf, size_t size)
     }
     char *result = orig_func(buf, size);
     if (result == NULL) return result;
-    char buffer[MAX_PATH];
-    const char *mapped = reverse_fix_path("getcwd", result, buffer, sizeof buffer);
-    if (mapped == result) return result;
-    // Copy back into caller's buffer or allocate if buf == NULL per POSIX
-    if (buf != NULL) {
-        size_t len = strlen(mapped) + 1;
-        if (len > size) {
-            errno = ERANGE;
-            return NULL;
-        }
-        strcpy(buf, mapped);
-        return buf;
-    } else {
-        return strdup(mapped);
-    }
+    // Don't apply reverse mapping to getcwd to avoid creating virtual directories
+    // that would cause relative paths to be mapped incorrectly
+    return result;
 }
 
 #ifdef __GLIBC__
@@ -732,11 +599,9 @@ char *get_current_dir_name(void)
     }
     char *result = orig_func();
     if (result == NULL) return result;
-    char buffer[MAX_PATH];
-    const char *mapped = reverse_fix_path("get_current_dir_name", result, buffer, sizeof buffer);
-    if (mapped == result) return result;
-    free(result);
-    return strdup(mapped);
+    // Don't apply reverse mapping to get_current_dir_name to avoid creating virtual directories
+    // that would cause relative paths to be mapped incorrectly
+    return result;
 }
 
 typedef char *(*orig_getwd_func_type)(char *buf);
@@ -749,14 +614,9 @@ char *getwd(char *buf)
     }
     char *result = orig_func(buf);
     if (result == NULL) return result;
-    char buffer[MAX_PATH];
-    const char *mapped = reverse_fix_path("getwd", result, buffer, sizeof buffer);
-    if (mapped == result) return result;
-    if (buf != NULL) {
-        strcpy(buf, mapped);
-        return buf;
-    }
-    return strdup(mapped);
+    // Don't apply reverse mapping to getwd to avoid creating virtual directories
+    // that would cause relative paths to be mapped incorrectly
+    return result;
 }
 #endif // __GLIBC__
 #endif // DISABLE_CHDIR
@@ -772,23 +632,8 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)
     if (orig_func == NULL) {
         orig_func = (orig_readlink_func_type)dlsym(RTLD_NEXT, "readlink");
     }
-    ssize_t n = orig_func(in, buf, bufsiz);
-    if (n > 0 && buf != NULL && bufsiz > 0) {
-        // NUL-terminate into a temp buffer to apply reverse mapping
-        char tmp[MAX_PATH];
-        size_t copy = (size_t)n < sizeof tmp - 1 ? (size_t)n : sizeof tmp - 1;
-        memcpy(tmp, buf, copy); tmp[copy] = '\0';
-        pm_normalize_path_inplace(tmp);
-        char out[MAX_PATH];
-        const char *virt = reverse_fix_path("readlink", tmp, out, sizeof out);
-        if (virt != tmp) {
-            size_t vlen = strlen(virt);
-            size_t writelen = vlen < bufsiz ? vlen : bufsiz;
-            memcpy(buf, virt, writelen);
-            return (ssize_t)writelen;
-        }
-    }
-    return n;
+    // Do not post-process symlink target; return exact bytes from filesystem
+    return orig_func(in, buf, bufsiz);
 }
 
 typedef ssize_t (*orig_readlinkat_func_type)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
@@ -803,22 +648,46 @@ ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
     if (orig_func == NULL) {
         orig_func = (orig_readlinkat_func_type)dlsym(RTLD_NEXT, "readlinkat");
     }
-    ssize_t n = orig_func(dirfd, in, buf, bufsiz);
-    if (n > 0 && buf != NULL && bufsiz > 0) {
-        char tmp[MAX_PATH];
-        size_t copy = (size_t)n < sizeof tmp - 1 ? (size_t)n : sizeof tmp - 1;
-        memcpy(tmp, buf, copy); tmp[copy] = '\0';
-        pm_normalize_path_inplace(tmp);
-        char out[MAX_PATH];
-        const char *virt = reverse_fix_path("readlinkat", tmp, out, sizeof out);
-        if (virt != tmp) {
-            size_t vlen = strlen(virt);
-            size_t writelen = vlen < bufsiz ? vlen : bufsiz;
-            memcpy(buf, virt, writelen);
-            return (ssize_t)writelen;
+    // Do not post-process symlink target; return exact bytes from filesystem
+    return orig_func(dirfd, in, buf, bufsiz);
+}
+
+// glibc FORTIFY wrappers may bypass our readlink/readlinkat unless we interpose them too
+typedef ssize_t (*orig___readlink_chk_func_type)(const char *pathname, char *buf, size_t bufsiz, size_t buflen);
+ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t buflen)
+{
+    debug_fprintf(stderr, "__readlink_chk(%s) called\n", pathname);
+    char inbuf[MAX_PATH];
+    const char *in = fix_path("__readlink_chk", pathname, inbuf, sizeof inbuf);
+    static orig___readlink_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___readlink_chk_func_type)dlsym(RTLD_NEXT, "__readlink_chk");
+        if (orig_func == NULL) {
+            // Fallback to plain readlink if fortified symbol not found
+            orig_readlink_func_type f = (orig_readlink_func_type)dlsym(RTLD_NEXT, "readlink");
+            return f ? f(in, buf, bufsiz) : -1;
         }
     }
-    return n;
+    return orig_func(in, buf, bufsiz, buflen);
+}
+
+typedef ssize_t (*orig___readlinkat_chk_func_type)(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen);
+ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen)
+{
+    debug_fprintf(stderr, "__readlinkat_chk(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char inbuf[MAX_PATH];
+    const char *in = fix_path("__readlinkat_chk", abs, inbuf, sizeof inbuf);
+    static orig___readlinkat_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___readlinkat_chk_func_type)dlsym(RTLD_NEXT, "__readlinkat_chk");
+        if (orig_func == NULL) {
+            orig_readlinkat_func_type f = (orig_readlinkat_func_type)dlsym(RTLD_NEXT, "readlinkat");
+            return f ? f(dirfd, in, buf, bufsiz) : -1;
+        }
+    }
+    return orig_func(dirfd, in, buf, bufsiz, buflen);
 }
 #endif // DISABLE_READLINK
 
@@ -861,7 +730,6 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
 }
 #endif // DISABLE_SYMLINK
 
-// Readdir family: reverse-map entry names if their full paths are under a mapped target
 static int resolve_fd_path_self(int fd, char *out, size_t out_size)
 {
     char linkp[64];
@@ -887,35 +755,9 @@ struct dirent *readdir(DIR *dirp)
     size_t dl = strlen(dirpath);
     size_t nl = strlen(ent->d_name);
     if (dl + 1 + nl + 1 >= MAX_PATH) return ent;
-    char full[MAX_PATH];
-    memcpy(full, dirpath, dl); full[dl] = '/'; memcpy(full + dl + 1, ent->d_name, nl + 1);
-    pm_normalize_path_inplace(full);
-    char out[MAX_PATH];
-    const char *virt = reverse_fix_path("readdir", full, out, sizeof out);
-    if (virt == full) return ent;
-    const char *slash = strrchr(virt, '/');
-    const char *newname = slash ? slash + 1 : virt;
-    size_t newlen = strlen(newname);
-    if (newlen <= nl) {
-        memcpy(ent->d_name, newname, newlen + 1);
-        return ent;
-    }
-    static __thread struct dirent *tls_ent = NULL;
-    static __thread size_t tls_cap = 0;
-    size_t need = offsetof(struct dirent, d_name) + newlen + 1;
-    if (need > tls_cap) {
-        size_t newcap = need;
-        struct dirent *nb = (struct dirent *)realloc(tls_ent, newcap);
-        if (!nb) return ent; // fallback
-        tls_ent = nb; tls_cap = newcap;
-    }
-    // Copy header fields, then write new name
-    *tls_ent = *ent;
-    memcpy(tls_ent->d_name, newname, newlen + 1);
-#ifdef _DIRENT_HAVE_D_RECLEN
-    tls_ent->d_reclen = (unsigned short)need;
-#endif
-    return tls_ent;
+    // Skip reverse mapping for readdir - it should work with real filesystem paths
+    // readdir operates on real filesystem paths, not virtual ones
+    return ent;
 }
 #ifdef __GLIBC__
 typedef struct dirent64 *(*orig_readdir64_func_type)(DIR *dirp);
@@ -1061,8 +903,56 @@ OVERRIDE_FUNCTION(1, 1, int, remove, const char *, pathname)
 
 #ifndef DISABLE_EXEC
 OVERRIDE_FUNCTION(2, 1, int, execv, const char *, filename, char * const*, argv)
-OVERRIDE_FUNCTION(3, 1, int, execve, const char *, filename, char * const*, argv, char * const*, env)
-OVERRIDE_FUNCTION(2, 1, int, execvp, const char *, filename, char * const*, argv)
+
+// Use common argv[0] update function
+static char** update_argv0(const char *original_path, const char *new_path, char * const* argv)
+{
+    return pm_update_argv0_common(original_path, new_path, argv, &g_config);
+}
+
+// Use common execution function
+static int execute_with_resolved_path_universal(const char *original_path, const char *final_path, char * const* argv,
+                                               char * const* env, void *exec_func, int has_env)
+{
+    return pm_execute_with_resolved_path_universal(original_path, final_path, argv, env, exec_func, has_env, &g_config);
+}
+
+
+// Special execve implementation for argv[0] handling
+typedef int (*orig_execve_func_type)(const char *, char * const*, char * const*);
+static orig_execve_func_type orig_execve_func = NULL;
+
+int execve(const char *filename, char * const* argv, char * const* env)
+{
+    debug_fprintf(stderr, "execve(%s) called\n", filename);
+
+    char buffer[MAX_PATH];
+    const char *final_path = fix_path("execve", filename, buffer, sizeof buffer);
+
+    if (orig_execve_func == NULL) {
+        orig_execve_func = (orig_execve_func_type)dlsym(RTLD_NEXT, "execve");
+    }
+
+    return execute_with_resolved_path_universal(filename, final_path, argv, env, orig_execve_func, 1);
+}
+
+// Special execvp implementation for symlink resolution
+typedef int (*orig_execvp_func_type)(const char *, char * const*);
+static orig_execvp_func_type orig_execvp_func = NULL;
+
+int execvp(const char *filename, char * const* argv)
+{
+    debug_fprintf(stderr, "execvp(%s) called\n", filename);
+
+    char buffer[MAX_PATH];
+    const char *final_path = fix_path("execvp", filename, buffer, sizeof buffer);
+
+    if (orig_execvp_func == NULL) {
+        orig_execvp_func = (orig_execvp_func_type)dlsym(RTLD_NEXT, "execvp");
+    }
+
+    return execute_with_resolved_path_universal(filename, final_path, argv, NULL, orig_execvp_func, 0);
+}
 OVERRIDE_FUNCTION(3, 1, int, execvpe, const char *, filename, char * const*, argv, char * const*, env)
 OVERRIDE_FUNCTION(5, 2, int, execveat, int, dirfd, const char *, pathname, char * const*, argv, char * const*, env, int, flags)
 
@@ -1073,7 +963,6 @@ int execl(const char *filename, const char *arg0, ...)
     char buffer[MAX_PATH];
     const char *new_path = fix_path("execl", filename, buffer, sizeof buffer);
 
-    // Note: call execv, not execl, because we can't call varargs functions with an unknown number of args
     static orig_execv_func_type execv_func = NULL;
     if (execv_func == NULL) {
         execv_func = (orig_execv_func_type)dlsym(RTLD_NEXT, "execv");
@@ -1110,7 +999,6 @@ int execlp(const char *filename, const char *arg0, ...)
     char buffer[MAX_PATH];
     const char *new_path = fix_path("execlp", filename, buffer, sizeof buffer);
 
-    // Note: call execvp, not execlp, because we can't call varargs functions with an unknown number of args
     static orig_execvp_func_type execvp_func = NULL;
     if (execvp_func == NULL) {
         execvp_func = (orig_execvp_func_type)dlsym(RTLD_NEXT, "execvp");
@@ -1147,7 +1035,6 @@ int execle(const char *filename, const char *arg0, ... /* , char *const env[] */
     char buffer[MAX_PATH];
     const char *new_path = fix_path("execle", filename, buffer, sizeof buffer);
 
-    // Note: call execve, not execle, because we can't call varargs functions with an unknown number of args
     static orig_execve_func_type execve_func = NULL;
     if (execve_func == NULL) {
         execve_func = (orig_execve_func_type)dlsym(RTLD_NEXT, "execve");
@@ -1454,6 +1341,10 @@ OVERRIDE_FUNCTION(5, 2, int, statx, int, dirfd, const char *, pathname, int, fla
 OVERRIDE_FUNCTION(2, 1, FILE *, setmntent, const char *, filename, const char *, type)
 #endif // DISABLE_MOUNT
 
+#ifndef DISABLE_UMOUNT
+OVERRIDE_FUNCTION(2, 1, int, umount2, const char *, target, int, flags)
+#endif // DISABLE_UMOUNT
+
 
 #ifndef DISABLE_GLOB
 typedef int (*glob_errfunc_t)(const char *, int);
@@ -1471,10 +1362,20 @@ int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *
     debug_fprintf(stderr, "posix_spawn(%s) called\n", path);
     char buffer[MAX_PATH];
     const char *new_path = fix_path("posix_spawn", path, buffer, sizeof buffer);
+
     static orig_posix_spawn_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_posix_spawn_func_type)dlsym(RTLD_NEXT, "posix_spawn");
     }
+
+    // Update argv[0] if path changed
+    char **new_argv = update_argv0(path, new_path, argv);
+    if (new_argv != NULL) {
+        int result = orig_func(pid, new_path, file_actions, attrp, new_argv, envp);
+        pm_free_argv0(new_argv, new_path);
+        return result;
+    }
+
     return orig_func(pid, new_path, file_actions, attrp, argv, envp);
 }
 
@@ -1484,10 +1385,20 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
     debug_fprintf(stderr, "posix_spawnp(%s) called\n", file);
     char buffer[MAX_PATH];
     const char *new_path = fix_path("posix_spawnp", file, buffer, sizeof buffer);
+
     static orig_posix_spawnp_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_posix_spawnp_func_type)dlsym(RTLD_NEXT, "posix_spawnp");
     }
+
+    // Update argv[0] if path changed
+    char **new_argv = update_argv0(file, new_path, argv);
+    if (new_argv != NULL) {
+        int result = orig_func(pid, new_path, file_actions, attrp, new_argv, envp);
+        pm_free_argv0(new_argv, new_path);
+        return result;
+    }
+
     return orig_func(pid, new_path, file_actions, attrp, argv, envp);
 }
 #endif // DISABLE_SPAWN

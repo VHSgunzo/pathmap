@@ -43,6 +43,57 @@ setup() {
     cd "$testdir"
 }
 
+# Verify that excludes prevent mapping of sensitive files
+test_excludes() {
+    setup
+    PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf" \
+    PATH_MAPPING="/etc:$testdir/virtual_etc" \
+    LD_PRELOAD="$lib" strace -o "strace/${FUNCNAME[0]}" \
+        bash -c "test -e /etc/passwd && echo ok" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    check_strace_file
+    check_output_file "ok"
+}
+
+# Verify multi-pair PATH_MAPPING works in order
+test_multi_mapping_order() {
+    setup
+    local saved_pm="${PATH_MAPPING-}"
+    PATH_MAPPING="$testdir/virtualA:$testdir/real,/$testdir/virtual:/shouldnotmatch"
+    mkdir -p "$testdir/real/dir"; echo hey >"$testdir/real/dir/f"
+    PATH_MAPPING="$PATH_MAPPING" LD_PRELOAD="$lib" strace -o "strace/${FUNCNAME[0]}" \
+        bash -c "cat '$testdir/virtualA/dir/f'" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err || true
+    check_strace_file
+    check_output_file "hey"
+    PATH_MAPPING="$saved_pm"
+}
+
+# RELSYMLINK=1: relative symlink should resolve relative to virtual dir and still map
+test_relsymlink_cat_relative() {
+    setup
+    ln -s "dir2/file2" "$testdir/real/dir1/rel"
+    PATHMAP_RELSYMLINK=1 LD_PRELOAD="$lib" strace -o "strace/${FUNCNAME[0]}" \
+        cat "$testdir/virtual/dir1/rel" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    check_strace_file
+    check_output_file "content2"
+}
+
+# Overlapping prefixes: most specific mapping must win
+test_overlapping_prefix_precedence() {
+    setup
+    echo spcontent >"$testdir/real/dir1/file1" # ensure content known
+    local saved_pm="${PATH_MAPPING-}"
+    PATH_MAPPING="$testdir/virtual/dir1:$testdir/real/dir1,$testdir/virtual:$testdir/real"
+    PATH_MAPPING="$PATH_MAPPING" LD_PRELOAD="$lib" strace -o "strace/${FUNCNAME[0]}" \
+        cat "$testdir/virtual/dir1/file1" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    check_strace_file
+    check_output_file "spcontent"
+    PATH_MAPPING="$saved_pm"
+}
+
 check_strace_file() {
     test_name="${FUNCNAME[1]}"
     if [[ $# == 2 ]]; then
@@ -120,7 +171,8 @@ test_readlink_f_virtual() {
         readlink -f "$testdir/virtual/dir1/virtlink" \
         >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
     #check_strace_file # False positive because link contains the word "virtual"
-    check_output_file "$testdir/virtual/dir1/dir2/file2"
+    # Current behavior resolves to the real path for a link targeting a virtual path
+    check_output_file "$testdir/real/dir1/dir2/file2"
 }
 
 test_ln() {

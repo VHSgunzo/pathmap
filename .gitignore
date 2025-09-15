@@ -4,3 +4,4 @@ pathmap-*
 .vscode
 AppDir
 squashfs-root
+*.AppImage

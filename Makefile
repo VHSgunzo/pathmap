@@ -5,7 +5,7 @@ override CFLAGS += -std=c99 -Wall
 SRCDIR = $(CURDIR)
 TESTDIR ?= /tmp/path-mapping
 TESTTOOLS = $(notdir $(basename $(wildcard $(SRCDIR)/test/testtool-*.c)))
-UNIT_TESTS = test-pathmatching test-common
+UNIT_TESTS = test-pathmatching test-common test-reverse test-argv0 test-parse-errors
 
 path-mapping.so: path-mapping.c
 	$(CC) $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
@@ -16,7 +16,7 @@ path-mapping-glibc.so: path-mapping.c
 path-mapping-musl.so: path-mapping.c
 	musl-gcc $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
 
-all: path-mapping.so pathmap path-mapping-glibc.so path-mapping-musl.so pathmap-static
+all: path-mapping.so pathmap pathmap-static
 
 clean:
 	rm -f *.so pathmap pathmap-static*
