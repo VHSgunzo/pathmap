@@ -1,27 +1,3 @@
-/*
-MIT License
-
-Copyright (c) 2022 Fritz Webering
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
-
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -176,22 +152,6 @@ static const char *fix_path(const char *function_name, const char *path, char *n
     return pm_fix_path_common(function_name, path, new_path, new_path_size, &g_config);
 }
 
-
-// Map a real filesystem path back to its virtual counterpart, if it lies under a mapped target
-static const char *reverse_fix_path(const char *function_name, const char *path, char *new_path, size_t new_path_size)
-{
-    if (path == NULL) return path;
-
-    // For reverse mapping, use common function
-    const char *mapped = pm_apply_reverse_mapping_with_config(path, new_path, new_path_size, &g_config.mapping_config);
-    // If reverse-mapped path would fall into an excluded prefix, skip applying it
-    if (mapped != path) {
-        if (pm_is_excluded_prefix(mapped, &g_config.mapping_config)) return path;
-        info_fprintf(stderr, "Reverse-Mapped Path: %s('%s') => '%s'\n", function_name, path, mapped);
-        return mapped;
-    }
-    return path;
-}
 
 
 // Join base directory (from dirfd or getcwd) with a possibly relative path
@@ -774,34 +734,7 @@ struct dirent64 *readdir64(DIR *dirp)
     size_t dl = strlen(dirpath);
     size_t nl = strlen(ent->d_name);
     if (dl + 1 + nl + 1 >= MAX_PATH) return ent;
-    char full[MAX_PATH];
-    memcpy(full, dirpath, dl); full[dl] = '/'; memcpy(full + dl + 1, ent->d_name, nl + 1);
-    pm_normalize_path_inplace(full);
-    char out[MAX_PATH];
-    const char *virt = reverse_fix_path("readdir64", full, out, sizeof out);
-    if (virt == full) return ent;
-    const char *slash = strrchr(virt, '/');
-    const char *newname = slash ? slash + 1 : virt;
-    size_t newlen = strlen(newname);
-    if (newlen <= nl) {
-        memcpy(ent->d_name, newname, newlen + 1);
-        return ent;
-    }
-    static __thread struct dirent64 *tls_ent64 = NULL;
-    static __thread size_t tls_cap64 = 0;
-    size_t need = offsetof(struct dirent64, d_name) + newlen + 1;
-    if (need > tls_cap64) {
-        size_t newcap = need;
-        struct dirent64 *nb = (struct dirent64 *)realloc(tls_ent64, newcap);
-        if (!nb) return ent; // fallback
-        tls_ent64 = nb; tls_cap64 = newcap;
-    }
-    *tls_ent64 = *ent;
-    memcpy(tls_ent64->d_name, newname, newlen + 1);
-#ifdef _DIRENT_HAVE_D_RECLEN
-    tls_ent64->d_reclen = (unsigned short)need;
-#endif
-    return tls_ent64;
+    return ent;
 }
 #endif
 #endif // DISABLE_OPENDIR

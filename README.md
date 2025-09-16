@@ -91,9 +91,6 @@ Compile-time `DISABLE_*` macros can exclude specific overrides; see `path-mappin
 
 ## LD_PRELOAD vs ptrace tracer differences
 
-- Reverse mapping:
-  - Library: does not post‑process `readlink*`; selectively adjusts names in `readdir64` when the new name fits; `getcwd` family is left as-is (see code).
-  - Tracer: reverse‑maps `getcwd`, `readlink*` (adjusts returned length if truncated), and `getdents*` (in‑place rename when the new name fits).
 - Relative paths:
   - Library: resolves via `/proc/self/fd/...` and normalizes.
   - Tracer: resolves in the tracee context via `/proc/<pid>/fd/...`.
@@ -119,7 +116,6 @@ PATH_MAPPING="/etc:/tmp/etc" ./pathmap --exclude "/etc/passwd,/etc/group,/etc/ns
 Details:
 - Architectures: x86_64, aarch64 (ARM64), riscv64.
 - Intercepts pre‑call: `open`, `openat`, `openat2`, `newfstatat`, `unlinkat`, `execve/execveat`, `statx`, `rename*`, `link*`, `mkdir*`, `mknod*`, `mkfifo*`, `chmod`, `lchown`, `fchownat`, `utimensat`, `access`/`faccessat`, `open_tree`, `move_mount`, and more.
-- Reverse mapping post‑call: `getcwd`, `readlink*`, `getdents*` (rename d_name in place when it fits).
 - Handles longer mapped paths by placing strings on the tracee stack and updating registers.
 - Follows `fork`/`vfork`/`clone`/`exec`.
 - CLI/env: `-p/--path-mapping` or `PATH_MAPPING`, `-x/--exclude` or `PATH_MAPPING_EXCLUDE`, `-d/--debug` or `PATHMAP_DEBUG=1`, `-r/--dry-run`, `-h/--help`, `-v/--version`.
@@ -131,14 +127,12 @@ Defaults and logging:
 
 Limitations:
 - Not all syscalls/ioctls with path semantics are handled.
-- `getdents*`: rename only when the new name is not longer than the original entry.
-- `readlink*`: reverse‑mapped result is truncated to caller buffer; returned length is adjusted.
 - aarch64: syscall numbers are not changed; only arguments/returns for supported calls are adjusted.
 - This is not a security boundary; prefer bind/overlay mounts when available.
 
 ## Known caveats
 1) Not a replacement for `mount --bind`. Static binaries and programs issuing direct syscalls won’t be affected by LD_PRELOAD (use the tracer).
-2) “Virtual” entries may not appear in directory listings from the library alone; the tracer partially compensates via `getdents*` post‑processing.
+2) "Virtual" entries not appear in directory listings.
 3) Relative symlinks crossing mapping boundaries may not behave as expected unless `PATHMAP_RELSYMLINK=1` is set.
 4) Functions resolved manually from `libc.so` via `dlopen`/`dlsym` bypass LD_PRELOAD.
 5) Changes in libc internals may break interception in the future.

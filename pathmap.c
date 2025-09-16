@@ -345,10 +345,6 @@ static const char *apply_mapping(const char *in, char *out, size_t out_size)
 	return res;
 }
 
-static const char *apply_reverse_mapping(const char *in, char *out, size_t out_size)
-{
-	return pm_apply_reverse_mapping_with_config(in, out, out_size, &g_config.mapping_config);
-}
 
 static void resolve_relative_for_pid(char *path, size_t path_size, pid_t pid, int dirfd)
 {
@@ -434,43 +430,8 @@ static void maybe_remap_path(pid_t pid, long sysno, TraceRegs *regs)
 	}
 }
 
-// Track getcwd arguments between entry/exit stops
-static unsigned long last_getcwd_buf = 0;
-static size_t last_getcwd_size = 0;
-static int in_getcwd = 0;
-static unsigned long last_readlink_buf = 0;
-static size_t last_readlink_size = 0;
-static int in_readlink = 0;
-static int in_getdents64 = 0;
-static int in_getdents = 0;
-static int last_getdents_fd = -1;
-static unsigned long last_getdents_buf = 0;
-static size_t last_getdents_size = 0;
 
-struct linux_dirent64_local {
-	uint64_t        d_ino;
-	int64_t         d_off;
-	unsigned short  d_reclen;
-	unsigned char   d_type;
-	char            d_name[];
-} __attribute__((packed));
 
-struct linux_dirent_local {
-	unsigned long   d_ino;
-	unsigned long   d_off;
-	unsigned short  d_reclen;
-	char            d_name[];
-} __attribute__((packed));
-
-static int resolve_fd_path(pid_t pid, int fd, char *out, size_t out_size)
-{
-	char linkp[64];
-	snprintf(linkp, sizeof linkp, "/proc/%d/fd/%d", pid, fd);
-	ssize_t n = readlink(linkp, out, out_size - 1);
-	if (n <= 0) return -1;
-	out[n] = '\0';
-	return 0;
-}
 
 typedef struct { pid_t pid; int in_syscall; } tracee_t;
 static int tracee_find_idx(tracee_t *arr, int count, pid_t p) {
@@ -488,31 +449,6 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 {
 	long sysno = get_sysno(regs);
 	g_current_syscall = NULL;
-	if (sysno == SYS_getcwd) {
-		last_getcwd_buf = get_arg(regs, 0);
-		last_getcwd_size = (size_t)get_arg(regs, 1);
-		in_getcwd = 1;
-		return;
-	}
-	// Track getdents64/getdents for possible future post-filtering (rename not feasible without reallocation).
-#ifdef SYS_getdents64
-	if (sysno == SYS_getdents64) {
-		in_getdents64 = 1;
-		last_getdents_fd = (int)get_arg(regs,0);
-		last_getdents_buf = get_arg(regs,1);
-		last_getdents_size = (size_t)get_arg(regs,2);
-		return;
-	}
-#endif
-#ifdef SYS_getdents
-	if (sysno == SYS_getdents) {
-		in_getdents = 1;
-		last_getdents_fd = (int)get_arg(regs,0);
-		last_getdents_buf = get_arg(regs,1);
-		last_getdents_size = (size_t)get_arg(regs,2);
-		return;
-	}
-#endif
 	// Common path-taking syscalls beyond open/stat/unlink/exec handled in maybe_remap_path:
 	// rename/renameat/renameat2
 	if (sysno == SYS_rename) {
@@ -595,9 +531,6 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 		g_current_syscall = "readlink";
 		// const char *pathname (rdi), char *buf (rsi), size_t bufsiz (rdx)
 		unsigned long paddr = get_arg(regs,0);
-		last_readlink_buf = get_arg(regs,1);
-		last_readlink_size = (size_t)get_arg(regs,2);
-		in_readlink = 1;
 		char path[MAX_PATH];
 		if (read_string(pid, paddr, path, sizeof path) == 0) {
 			// Normalize absolute or resolve relative
@@ -620,9 +553,6 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 		// int dirfd (rdi), const char *pathname (rsi), char *buf (rdx), size_t bufsiz (r10)
 		int dirfd = (int)get_arg(regs,0);
 		unsigned long paddr = get_arg(regs,1);
-		last_readlink_buf = get_arg(regs,2);
-		last_readlink_size = (size_t)get_arg(regs,3);
-		in_readlink = 1;
 		char path[MAX_PATH];
 		if (read_string(pid, paddr, path, sizeof path) == 0) {
 			resolve_relative_for_pid(path, sizeof path, pid, dirfd);
@@ -833,186 +763,6 @@ if (sysno == SYS_open_by_handle_at) { g_current_syscall = "open_by_handle_at"; r
 	maybe_remap_path(pid, sysno, regs);
 }
 
-static void on_sys_exit(pid_t pid, TraceRegs *regs)
-{
-	long sysno = get_sysno(regs);
-	if (sysno == SYS_getcwd && in_getcwd) {
-		in_getcwd = 0;
-		long ret = (long)get_retval(regs);
-		/* retval arch-agnostic read via local copy after regs_read; we already have regs */
-		/* On x86_64 it's rax; on aarch64/riscv it's args[0]/a0 but kernel places retval there.
-		 * For simplicity we infer from earlier readlink handling; leave ret as-is if needed. */
-		ret = (long)ret; /* placeholder no-op */
-		if (ret > 0 && last_getcwd_buf != 0) {
-			char buf[MAX_PATH];
-			if (read_string(pid, last_getcwd_buf, buf, sizeof buf) == 0) {
-				pm_normalize_path_inplace(buf);
-				char out[MAX_PATH];
-				const char *virt = apply_reverse_mapping(buf, out, sizeof out);
-				if (virt != buf) {
-					// Only write back if fits
-					size_t maxlen = last_getcwd_size ? last_getcwd_size - 1 : (size_t)ret;
-					if (strlen(virt) <= maxlen) {
-						write_string_if_fits(pid, last_getcwd_buf, virt, maxlen);
-					}
-				}
-			}
-		}
-		last_getcwd_buf = 0; last_getcwd_size = 0;
-	}
-	if ((sysno == SYS_readlink || sysno == SYS_readlinkat) && in_readlink) {
-		in_readlink = 0;
-		long ret = (long)get_retval(regs);
-		if (ret > 0 && last_readlink_buf != 0) {
-			// readlink returns length without NUL
-			size_t n = (size_t)ret;
-			if (last_readlink_size > 0 && n > last_readlink_size) n = last_readlink_size;
-			char buf[MAX_PATH];
-			struct iovec local = { .iov_base = buf, .iov_len = n };
-			struct iovec remote = { .iov_base = (void *)last_readlink_buf, .iov_len = n };
-			if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) {
-				if (n < sizeof buf) buf[n] = '\0'; else buf[sizeof buf - 1] = '\0';
-				pm_normalize_path_inplace(buf);
-				char out[MAX_PATH];
-				const char *virt = apply_reverse_mapping(buf, out, sizeof out);
-				if (virt != buf) {
-					size_t vlen = strlen(virt);
-					size_t maxout = last_readlink_size; // API says caller provides size
-					if (maxout == 0) maxout = (size_t)ret; // fallback
-					size_t writelen = vlen < maxout ? vlen : maxout;
-					struct iovec l2 = { .iov_base = (void *)virt, .iov_len = writelen };
-					struct iovec r2 = { .iov_base = (void *)last_readlink_buf, .iov_len = writelen };
-					process_vm_writev(pid, &l2, 1, &r2, 1, 0);
-					// update return value to reflect possibly truncated length
-					set_retval(regs, (unsigned long)writelen);
-					regs_write(pid, regs);
-				}
-			}
-		}
-		last_readlink_buf = 0; last_readlink_size = 0;
-	}
-#ifdef SYS_getdents64
-	if (sysno == SYS_getdents64 && in_getdents64) {
-		in_getdents64 = 0;
-		long ret = (long)get_retval(regs);
-		if (ret > 0 && last_getdents_buf != 0) {
-			size_t n = (size_t)ret;
-			if (n > last_getdents_size && last_getdents_size > 0) n = last_getdents_size;
-			char *buf = malloc(n);
-			if (buf) {
-				struct iovec local = { .iov_base = buf, .iov_len = n };
-				struct iovec remote = { .iov_base = (void *)last_getdents_buf, .iov_len = n };
-				if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) {
-					char dirpath[MAX_PATH];
-					if (resolve_fd_path(pid, last_getdents_fd, dirpath, sizeof dirpath) == 0) {
-						size_t off = 0;
-						while (off + sizeof(struct linux_dirent64_local) < n) {
-							struct linux_dirent64_local *d = (struct linux_dirent64_local *)(buf + off);
-							if (d->d_reclen == 0 || off + d->d_reclen > n) break;
-							char *name = d->d_name;
-							// Ensure NUL within record
-							size_t namemax = d->d_reclen - ((unsigned char *)name - (unsigned char *)d);
-							size_t namelen = strnlen(name, namemax);
-							if (namelen < namemax) {
-								char full[MAX_PATH];
-								// full = dirpath + "/" + name
-								size_t dl = strlen(dirpath);
-								if (dl + 1 + namelen < sizeof full) {
-									memcpy(full, dirpath, dl);
-									full[dl] = '/';
-									memcpy(full + dl + 1, name, namelen);
-									full[dl + 1 + namelen] = '\0';
-									pm_normalize_path_inplace(full);
-									char out[MAX_PATH];
-									const char *virt = apply_reverse_mapping(full, out, sizeof out);
-									if (virt != full) {
-										// Derive new basename
-										const char *slash = strrchr(virt, '/');
-										const char *newname = slash ? slash + 1 : virt;
-										size_t newlen = strlen(newname);
-										if (newlen <= namemax - 1 && newlen <= namelen) {
-											// Overwrite in-place, NUL-terminate, leave reclen
-											memcpy(name, newname, newlen);
-											name[newlen] = '\0';
-											// zero the rest of old name bytes for cleanliness
-											for (size_t zi = newlen + 1; zi < namelen; zi++) name[zi] = '\0';
-										}
-									}
-								}
-							}
-							off += d->d_reclen;
-						}
-						// write back modified buffer
-						struct iovec l2 = { .iov_base = buf, .iov_len = n };
-						struct iovec r2 = { .iov_base = (void *)last_getdents_buf, .iov_len = n };
-						process_vm_writev(pid, &l2, 1, &r2, 1, 0);
-					}
-				}
-				free(buf);
-			}
-		}
-		last_getdents_fd = -1; last_getdents_buf = 0; last_getdents_size = 0;
-	}
-#endif
-#ifdef SYS_getdents
-	if (sysno == SYS_getdents && in_getdents) {
-		in_getdents = 0;
-		long ret = (long)get_retval(regs);
-		if (ret > 0 && last_getdents_buf != 0) {
-			size_t n = (size_t)ret;
-			if (n > last_getdents_size && last_getdents_size > 0) n = last_getdents_size;
-			char *buf = malloc(n);
-			if (buf) {
-				struct iovec local = { .iov_base = buf, .iov_len = n };
-				struct iovec remote = { .iov_base = (void *)last_getdents_buf, .iov_len = n };
-				if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)n) {
-					char dirpath[MAX_PATH];
-					if (resolve_fd_path(pid, last_getdents_fd, dirpath, sizeof dirpath) == 0) {
-						size_t off = 0;
-						while (off + sizeof(struct linux_dirent_local) < n) {
-							struct linux_dirent_local *d = (struct linux_dirent_local *)(buf + off);
-							if (d->d_reclen == 0 || off + d->d_reclen > n) break;
-							char *name = d->d_name;
-							size_t namemax = d->d_reclen - ((unsigned char *)name - (unsigned char *)d);
-							size_t namelen = strnlen(name, namemax);
-							if (namelen < namemax) {
-								char full[MAX_PATH];
-								size_t dl = strlen(dirpath);
-								if (dl + 1 + namelen < sizeof full) {
-									memcpy(full, dirpath, dl);
-									full[dl] = '/';
-									memcpy(full + dl + 1, name, namelen);
-									full[dl + 1 + namelen] = '\0';
-									pm_normalize_path_inplace(full);
-									char out[MAX_PATH];
-									const char *virt = apply_reverse_mapping(full, out, sizeof out);
-									if (virt != full) {
-										const char *slash = strrchr(virt, '/');
-										const char *newname = slash ? slash + 1 : virt;
-										size_t newlen = strlen(newname);
-										if (newlen <= namemax - 1 && newlen <= namelen) {
-											memcpy(name, newname, newlen);
-											name[newlen] = '\0';
-											for (size_t zi = newlen + 1; zi < namelen; zi++) name[zi] = '\0';
-										}
-									}
-								}
-							}
-							off += d->d_reclen;
-						}
-						struct iovec l2 = { .iov_base = buf, .iov_len = n };
-						struct iovec r2 = { .iov_base = (void *)last_getdents_buf, .iov_len = n };
-						process_vm_writev(pid, &l2, 1, &r2, 1, 0);
-					}
-				}
-				free(buf);
-			}
-		}
-		last_getdents_fd = -1; last_getdents_buf = 0; last_getdents_size = 0;
-	}
-#endif
-}
-
 int main(int argc, char **argv)
 {
 	const char *cli_mapping = NULL;
@@ -1177,7 +927,7 @@ int main(int argc, char **argv)
 			tracees[idx].in_syscall ^= 1;
 			TraceRegs regs;
 			if (regs_read(pid, &regs) == -1) { goto resume; }
-			if (tracees[idx].in_syscall) on_sys_enter(pid, &regs); else on_sys_exit(pid, &regs);
+			if (tracees[idx].in_syscall) on_sys_enter(pid, &regs);
 			// regs may have been updated on exit; no need to set unless changed inside handlers
 		}
 		else {

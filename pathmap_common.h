@@ -253,15 +253,6 @@ static inline const char *pm_apply_mapping_with_config(const char *in, char *out
     return pm_apply_mapping_pairs(in, (const char *(*)[2])config->mappings, (int)config->mapping_count, out, out_size);
 }
 
-static inline const char *pm_apply_reverse_mapping_with_config(const char *in, char *out, size_t out_size, const struct pm_mapping_config *config)
-{
-    for (size_t i = 0; i < config->mapping_count; i++) {
-        const char *pair[1][2] = { { config->mappings[i][1], config->mappings[i][0] } };
-        const char *mapped = pm_apply_mapping_pairs(in, pair, 1, out, out_size);
-        if (mapped != in) return mapped;
-    }
-    return in;
-}
 
 // Implementation of symlink resolution with virtual directory support
 static inline const char* pm_resolve_symlink_path_impl(const char *original_path, const char *mapped_path, char *resolved_buffer, size_t buffer_size, const struct pm_mapping_config *config)
