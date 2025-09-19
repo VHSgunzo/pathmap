@@ -32,14 +32,51 @@ The LD_PRELOAD library intercepts libc functions that take path arguments (`open
 
 ## Configuration
 
-- `PATH_MAPPING` provides pairs in the form `FROM:TO[,FROM:TO...]`:
-  ```bash
-  export PATH_MAPPING="/usr/virtual1:/map/dest1,/usr/virtual2:/map/dest2"
-  ```
+### Path Mapping Format
+
+`PATH_MAPPING` provides pairs in the form `FROM:TO[,FROM:TO...]`:
+```bash
+export PATH_MAPPING="/usr/virtual1:/map/dest1,/usr/virtual2:/map/dest2"
+```
+
+#### Basic Examples
+```bash
+# Simple prefix mapping
+PATH_MAPPING="/usr/share/app:/home/user/.local/share/app"
+
+# Multiple mappings
+PATH_MAPPING="/usr/share/app:/home/user/.local/share/app,/usr/bin/app:/home/user/.local/bin/app"
+
+# Multi-line format (also supported)
+PATH_MAPPING="/usr/share/app:/home/user/.local/share/app
+/usr/bin/app:/home/user/.local/bin/app
+/usr/lib/app:/home/user/.local/lib/app"
+```
+
 - If unset/empty, both the library and the tracer use the same built-in default pairs from `pathmap_common.h` (test defaults).
 
+### Reverse mapping (virtualizing outputs)
+By default reverse mapping is enabled and user-visible paths are virtualized (set in `pathmap_common.h`: `#define PM_DEFAULT_REVERSE_ENABLED 1`).
+
+- `ls`/`readdir`/`getdents*`: directory entry names are rewritten back to the virtual names.
+  - Special Case 2: virtual-root child normalization. If a mapping is `/app/usr -> /real/usr-123`, then `ls -1 /app` prints `usr` (not `usr-123`).
+- `readlink -f` on virtual paths returns the virtualized absolute path.
+- `pwd`/`getcwd` and `readlink /proc/<pid>/cwd` are virtualized to return the virtual CWD.
+- Set `PATHMAP_REVERSE=0` to disable reverse mapping.
+
+Examples (preload and tracer behave the same):
+```bash
+# Virtualize outputs (default)
+PATH_MAPPING="/app:$PWD" LD_PRELOAD=$PWD/path-mapping.so ls -1 /app
+
+# Tracer variants
+PATH_MAPPING="/app:$PWD" ./pathmap -- ls -1 /app
+```
+
 ### Exclusions
-Skip mapping for sensitive prefixes via `PATH_MAPPING_EXCLUDE` (comma-separated absolute prefixes):
+
+Skip mapping for sensitive prefixes via `PATH_MAPPING_EXCLUDE`:
+
 ```bash
 export PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev"
 export PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf"
@@ -52,7 +89,74 @@ PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf" \
 PATH_MAPPING_EXCLUDE="/etc/passwd,/etc/group,/etc/nsswitch.conf" \
   PATH_MAPPING="/etc:/tmp/etc,/dev:/tmp/dev" LD_PRELOAD=./path-mapping.so bash
 ```
+
 Defaults apply if not set: `/etc/passwd,/etc/group,/etc/nsswitch.conf`.
+
+### Glob Pattern Support and Parsing
+
+#### Glob Pattern Support
+
+**In Path Mappings (FROM patterns):**
+- ✅ **`*` (asterisk)**: Supported with FNM_PATHNAME semantics
+  - Matches any characters within a single path segment (doesn't cross `/` boundaries)
+  - Supports capture groups for substitution in TO patterns
+  - Multiple `*` patterns are supported
+- ❌ **`?` (question mark)**: Not supported
+- ❌ **`[ ]` (character classes)**: Not supported
+
+**In Exclusions (PATH_MAPPING_EXCLUDE):**
+- ✅ **Full glob support**: `*`, `?`, `[ ]`, and all standard glob patterns
+- Uses standard `fnmatch()` with `FNM_PATHNAME` semantics
+
+#### Examples
+
+**Glob patterns in mappings:**
+```bash
+# ✅ Single asterisk - captures locale directory
+PATH_MAPPING="/usr/share/locale/*:/tmp/AppDir/usr/share/locale/*"
+# Maps: /usr/share/locale/en/LC_MESSAGES/app.mo -> /tmp/AppDir/usr/share/locale/en/LC_MESSAGES/app.mo
+
+# ✅ Multiple asterisks - captures multiple segments
+PATH_MAPPING="/usr/share/locale/*/*/app.mo:/tmp/AppDir/usr/share/locale/*/*/app.mo"
+# Maps: /usr/share/locale/en/LC_MESSAGES/app.mo -> /tmp/AppDir/usr/share/locale/en/LC_MESSAGES/app.mo
+
+# ❌ These will NOT work as glob patterns (treated as literal paths):
+PATH_MAPPING="/usr/share/locale/??/LC_MESSAGES:/tmp/AppDir/usr/share/locale/??/LC_MESSAGES"
+PATH_MAPPING="/usr/share/locale/[a-z]*:/tmp/AppDir/usr/share/locale/[a-z]*"
+```
+
+**Glob patterns in exclusions:**
+```bash
+# ✅ Full glob support in exclusions
+PATH_MAPPING_EXCLUDE="/proc/*/*,/sys/*,/tmp/test[0-9]*,/var/log/*.log"
+
+# Examples of what gets excluded:
+# /proc/self/cwd, /proc/1234/status
+# /sys/kernel, /sys/devices
+# /tmp/test1, /tmp/test2, /tmp/test9
+# /var/log/app.log, /var/log/system.log
+```
+
+#### Parsing Rules
+
+**Common parsing rules for both PATH_MAPPING and PATH_MAPPING_EXCLUDE:**
+- **Separators**: Items separated by commas (`,`), newlines (`\n`), or carriage returns (`\r`)
+- **Whitespace**: Leading and trailing spaces/tabs are automatically trimmed
+- **Empty entries**: Empty items are skipped
+- **Path normalization**: All paths are normalized (collapsed `.`/`..`, removed duplicate slashes)
+- **Glob detection**: Patterns containing `*`, `?`, or `[` are automatically detected as glob patterns
+
+**PATH_MAPPING specific:**
+- **Format**: Each pair must be `FROM:TO` with exactly one colon
+- **Required fields**: Both FROM and TO must be non-empty after trimming
+- **Invalid pairs**: Pairs without `:` or with empty FROM/TO are silently skipped
+
+#### Error Handling
+
+- **Invalid pairs**: Pairs without `:` or with empty FROM/TO are silently skipped
+- **Memory allocation failures**: Parsing stops gracefully, partial results may be available
+- **Buffer overflow**: Paths longer than `MAX_PATH` (4096) are truncated
+- **Empty input**: Falls back to built-in defaults without error
 
 ### Symlink resolution
 By default the library does not resolve symlinks post-mapping. Enable post‑resolution with `PATHMAP_RELSYMLINK=1`.
@@ -64,6 +168,29 @@ Examples:
 ```bash
 PATHMAP_RELSYMLINK=1 PATH_MAPPING="/opt/virtual:/real/root" LD_PRELOAD=./path-mapping.so app
 PATHMAP_RELSYMLINK=1 PATH_MAPPING="/opt/virtual:/real/root" ./pathmap -- app
+```
+
+### CWD virtualization
+- On `getcwd()` and `readlink(/proc/<pid>/cwd)`, the returned path is rewritten back to the virtual path under reverse mapping.
+
+Examples:
+```bash
+PATH_MAPPING="/app:$PWD" LD_PRELOAD=$PWD/path-mapping.so bash -lc 'cd /app; pwd -P'
+# => /app
+
+PATH_MAPPING="/app:$PWD" ./pathmap -- bash -lc 'cd /app; pwd -P'
+# => /app
+```
+
+### Hiding a real directory by re-mapping it to /nowhere
+You can effectively hide a real directory by re-mapping its real path to `/nowhere` while exposing it under a virtual mount point.
+
+```bash
+# Expose real content at /hidden, but any direct access to /real goes to /nowhere
+PATH_MAPPING="/hidden:/real,/real:/nowhere" LD_PRELOAD=$PWD/path-mapping.so bash -lc "ls / && ls /hidden && ls /real || echo hidden"
+
+# Tracer variant
+PATH_MAPPING="/hide:/real,/real:/nowhere" ./pathmap -- bash -lc "ls / && ls /hide && ls /real || echo hidden"
 ```
 
 ## Build and install
@@ -132,10 +259,13 @@ Limitations:
 
 ## Known caveats
 1) Not a replacement for `mount --bind`. Static binaries and programs issuing direct syscalls won’t be affected by LD_PRELOAD (use the tracer).
-2) "Virtual" entries not appear in directory listings.
-3) Relative symlinks crossing mapping boundaries may not behave as expected unless `PATHMAP_RELSYMLINK=1` is set.
-4) Functions resolved manually from `libc.so` via `dlopen`/`dlsym` bypass LD_PRELOAD.
-5) Changes in libc internals may break interception in the future.
+2) Relative symlinks crossing mapping boundaries require `PATHMAP_RELSYMLINK=1` to behave as expected (applies to both preload and tracer).
+3) Some libc-only functions are not hooked by the tracer (e.g. `realpath(3)`); tracer achieves similar behavior via syscalls. Tools relying purely on libc without issuing syscalls may differ subtly under the tracer.
+4) Extended attributes: behavior depends on filesystem support and permissions. On some systems `l*xattr` on symlinks returns `EPERM` or `ENOTSUP`.
+5) Mount API: `umount2`/mount-related calls typically require elevated privileges and are expected to fail for unprivileged users; interception only remaps path arguments.
+6) Mapping real paths to non-directories (e.g. to `/nowhere`) can break programs that traverse those real paths directly. Prefer hiding via virtual mount-points and excludes.
+7) Functions resolved manually from `libc.so` via `dlopen`/`dlsym` bypass LD_PRELOAD.
+8) Changes in libc internals may break interception in the future.
 
 ## License
 MIT — see `LICENSE`.

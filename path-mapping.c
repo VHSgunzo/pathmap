@@ -88,10 +88,6 @@ struct mount_attr;
 
 // Use common configuration structure
 static struct pm_common_config g_config;
-static const char *(*path_map)[2] = (const char *(*)[2])g_config.mapping_config.mappings;
-static int path_map_length = 0; // Will be set from g_config.mapping_config.mapping_count
-static char *path_map_buffer = NULL;
-static char **path_map_linear = NULL; // 2*N entries if env specified
 
 
 //////////////////////////////////////////////////////////
@@ -105,27 +101,23 @@ static void path_mapping_init()
     // Initialize common configuration
     pm_init_common_config(&g_config);
 
-    // Set up legacy variables for compatibility
-    path_map_length = (int)g_config.mapping_config.mapping_count;
-
-    // Handle legacy linear buffer for environment-based mappings
-    const char *env_string = getenv("PATH_MAPPING");
-    if (env_string != NULL && strlen(env_string) > 0) {
-        int pairs_len = 0;
-        char **linear = NULL;
-        char *buf = NULL;
-        int rc = pm_parse_path_mapping_env(env_string, &linear, &pairs_len, &buf);
-        if (rc == -2) {
-            error_fprintf(stderr, "PATH_MAPPING must have an even number of parts\n");
-            exit(255);
-        } else if (rc != 0) {
-            error_fprintf(stderr, "PATH_MAPPING out of memory\n");
-            exit(255);
-        }
-        if (pairs_len > 0) {
-            path_map_linear = linear;
-            path_map_buffer = buf;
-            path_map = (const char *(*)[2])linear;
+    // Minimal startup CWD fix using common helpers
+    {
+        char real_cwd[MAX_PATH];
+        ssize_t n = pm_readlink_real("/proc/self/cwd", real_cwd, sizeof real_cwd - 1);
+        if (n > 0) {
+            real_cwd[n] = '\0';
+            pm_normalize_path_inplace(real_cwd);
+            if (pm_startup_cwd_needs_fix(real_cwd, &g_config.mapping_config)) {
+                struct pm_cwd_plan plan;
+                pm_build_validated_startup_cwd_plan(real_cwd, &plan, &g_config.mapping_config);
+                if (plan.have_target) {
+                    info_fprintf(stderr, "Startup CWD fix: '%s' => '%s' (PWD='%s')\n", real_cwd, plan.chdir_target, plan.pwd_value);
+                    if (chdir(plan.chdir_target) == 0) {
+                        setenv("PWD", plan.pwd_value, 1);
+                    }
+                }
+            }
         }
     }
 }
@@ -133,10 +125,6 @@ static void path_mapping_init()
 __attribute__((destructor))
 static void path_mapping_deinit()
 {
-    if (path_map_linear) {
-        free(path_map_linear);
-    }
-    free(path_map_buffer);
     pm_cleanup_common_config(&g_config);
 }
 
@@ -150,6 +138,22 @@ static void path_mapping_deinit()
 static const char *fix_path(const char *function_name, const char *path, char *new_path, size_t new_path_size)
 {
     return pm_fix_path_common(function_name, path, new_path, new_path_size, &g_config);
+}
+
+// Reverse-map a real filesystem path back to virtual if enabled
+static const char *reverse_fix_path(const char *function_name, const char *path, char *new_path, size_t new_path_size)
+{
+    if (path == NULL) return path;
+    if (!g_config.reverse_enabled) return path;
+    // Only reverse-map when the path lies under some TO (real) prefix
+    if (!pm_is_under_any_to_prefix(path, &g_config.mapping_config)) return path;
+    const char *mapped = pm_apply_reverse_mapping_with_config(path, new_path, new_path_size, &g_config.mapping_config);
+    if (mapped != path) {
+        if (pm_is_excluded_prefix(mapped, &g_config.mapping_config)) return path;
+        info_fprintf(stderr, "Reverse-Mapped Path: %s('%s') => '%s'\n", function_name, path, mapped);
+        return mapped;
+    }
+    return path;
 }
 
 
@@ -305,7 +309,26 @@ int openat(int dirfd, const char *pathname, int flags, ...)
     return orig_func(dirfd, new_path, flags);
 }
 #ifdef __GLIBC__
-OVERRIDE_FUNCTION_VARARGS(3, 2, int, openat64, int, dirfd, const char *, pathname, int, flags)
+typedef int (*orig_openat64_func_type)(int dirfd, const char *pathname, int flags, ...);
+int openat64(int dirfd, const char *pathname, int flags, ...)
+{
+    debug_fprintf(stderr, "openat64(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("openat64", abs, buffer, sizeof buffer);
+
+    static orig_openat64_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_openat64_func_type)dlsym(RTLD_NEXT, "openat64");
+    }
+
+    if ((flags & O_CREAT) != 0) {
+        va_list args; va_start(args, flags); int mode = va_arg(args, int); va_end(args);
+        return orig_func(dirfd, new_path, flags, mode);
+    }
+    return orig_func(dirfd, new_path, flags);
+}
 #endif
 #endif // DISABLE_OPENAT
 
@@ -315,8 +338,10 @@ typedef int (*orig_openat2_func_type)(int dirfd, const char *pathname, struct op
 int openat2(int dirfd, const char *pathname, struct open_how *how, size_t size)
 {
     debug_fprintf(stderr, "openat2(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
     char buffer[MAX_PATH];
-    const char *new_path = fix_path("openat2", pathname, buffer, sizeof buffer);
+    const char *new_path = fix_path("openat2", abs, buffer, sizeof buffer);
     static orig_openat2_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_openat2_func_type)dlsym(RTLD_NEXT, "openat2");
@@ -384,9 +409,50 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
     return orig_func(dirfd, new_path, statbuf, flags);
 }
 #ifdef __GLIBC__
-OVERRIDE_FUNCTION(4, 2, int, fstatat64, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags)
-OVERRIDE_FUNCTION(5, 3, int, __fxstatat, int, ver, int, dirfd, const char *, pathname, struct stat *, statbuf, int, flags)
-OVERRIDE_FUNCTION(5, 3, int, __fxstatat64, int, ver, int, dirfd, const char *, pathname, struct stat64 *, statbuf, int, flags)
+typedef int (*orig_fstatat64_func_type)(int dirfd, const char *pathname, struct stat64 *statbuf, int flags);
+int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
+{
+    debug_fprintf(stderr, "fstatat64(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("fstatat64", abs, buffer, sizeof buffer);
+    static orig_fstatat64_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_fstatat64_func_type)dlsym(RTLD_NEXT, "fstatat64");
+    }
+    return orig_func(dirfd, new_path, statbuf, flags);
+}
+
+typedef int (*orig___fxstatat_func_type)(int ver, int dirfd, const char *pathname, struct stat *statbuf, int flags);
+int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *statbuf, int flags)
+{
+    debug_fprintf(stderr, "__fxstatat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fxstatat", abs, buffer, sizeof buffer);
+    static orig___fxstatat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fxstatat_func_type)dlsym(RTLD_NEXT, "__fxstatat");
+    }
+    return orig_func(ver, dirfd, new_path, statbuf, flags);
+}
+
+typedef int (*orig___fxstatat64_func_type)(int ver, int dirfd, const char *pathname, struct stat64 *statbuf, int flags);
+int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
+{
+    debug_fprintf(stderr, "__fxstatat64(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fxstatat64", abs, buffer, sizeof buffer);
+    static orig___fxstatat64_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fxstatat64_func_type)dlsym(RTLD_NEXT, "__fxstatat64");
+    }
+    return orig_func(ver, dirfd, new_path, statbuf, flags);
+}
 #endif
 #endif // DISABLE_FSTATAT
 
@@ -447,7 +513,20 @@ OVERRIDE_FUNCTION(2, 1, int, mkdir, const char *, pathname, mode_t, mode)
 
 
 #ifndef DISABLE_MKDIR
-OVERRIDE_FUNCTION(3, 2, int, mkdirat, int, dirfd, const char *, pathname, mode_t, mode)
+typedef int (*orig_mkdirat_func_type)(int dirfd, const char *pathname, mode_t mode);
+int mkdirat(int dirfd, const char *pathname, mode_t mode)
+{
+    debug_fprintf(stderr, "mkdirat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("mkdirat", abs, buffer, sizeof buffer);
+    static orig_mkdirat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_mkdirat_func_type)dlsym(RTLD_NEXT, "mkdirat");
+    }
+    return orig_func(dirfd, new_path, mode);
+}
 #endif // DISABLE_MKDIR
 
 
@@ -541,11 +620,24 @@ char *getcwd(char *buf, size_t size)
     if (orig_func == NULL) {
         orig_func = (orig_getcwd_func_type)dlsym(RTLD_NEXT, "getcwd");
     }
-    char *result = orig_func(buf, size);
-    if (result == NULL) return result;
-    // Don't apply reverse mapping to getcwd to avoid creating virtual directories
-    // that would cause relative paths to be mapped incorrectly
-    return result;
+    // First, get the real CWD from libc
+    char tmp_real[MAX_PATH];
+    char *real_ptr = orig_func(tmp_real, sizeof tmp_real);
+    if (real_ptr == NULL) return NULL;
+    // Compute preferred virtual path (reverse mapping). If unchanged, use the real one.
+    char vbuf[MAX_PATH];
+    const char *virt = pm_apply_reverse_mapping_with_config(real_ptr, vbuf, sizeof vbuf, &g_config.mapping_config);
+    const char *final_str = (virt != real_ptr) ? virt : real_ptr;
+    size_t need = strlen(final_str) + 1;
+    if (buf == NULL) {
+        char *out = (char *)malloc(need);
+        if (!out) { errno = ENOMEM; return NULL; }
+        memcpy(out, final_str, need);
+        return out;
+    }
+    if (size == 0 || need > size) { errno = ERANGE; return NULL; }
+    memcpy(buf, final_str, need);
+    return buf;
 }
 
 #ifdef __GLIBC__
@@ -557,11 +649,19 @@ char *get_current_dir_name(void)
     if (orig_func == NULL) {
         orig_func = (orig_get_current_dir_name_func_type)dlsym(RTLD_NEXT, "get_current_dir_name");
     }
-    char *result = orig_func();
-    if (result == NULL) return result;
-    // Don't apply reverse mapping to get_current_dir_name to avoid creating virtual directories
-    // that would cause relative paths to be mapped incorrectly
-    return result;
+    char *real = orig_func();
+    if (real == NULL) return NULL;
+    char vbuf[MAX_PATH];
+    const char *virt = pm_apply_reverse_mapping_with_config(real, vbuf, sizeof vbuf, &g_config.mapping_config);
+    if (virt == real) {
+        return real; // already suitable
+    }
+    size_t need = strlen(virt) + 1;
+    char *out = (char *)malloc(need);
+    if (!out) { free(real); errno = ENOMEM; return NULL; }
+    memcpy(out, virt, need);
+    free(real);
+    return out;
 }
 
 typedef char *(*orig_getwd_func_type)(char *buf);
@@ -572,11 +672,18 @@ char *getwd(char *buf)
     if (orig_func == NULL) {
         orig_func = (orig_getwd_func_type)dlsym(RTLD_NEXT, "getwd");
     }
-    char *result = orig_func(buf);
-    if (result == NULL) return result;
-    // Don't apply reverse mapping to getwd to avoid creating virtual directories
-    // that would cause relative paths to be mapped incorrectly
-    return result;
+    if (buf == NULL) { errno = EFAULT; return NULL; }
+    char tmp_real[MAX_PATH];
+    char *real_ptr = orig_func(tmp_real);
+    if (real_ptr == NULL) return NULL;
+    char vbuf[MAX_PATH];
+    const char *virt = pm_apply_reverse_mapping_with_config(real_ptr, vbuf, sizeof vbuf, &g_config.mapping_config);
+    const char *final_str = (virt != real_ptr) ? virt : real_ptr;
+    size_t need = strlen(final_str) + 1;
+    // getwd historically requires enough space; if not enough, set errno and return NULL
+    if (need > PATH_MAX) { errno = ERANGE; return NULL; }
+    memcpy(buf, final_str, need);
+    return buf;
 }
 #endif // __GLIBC__
 #endif // DISABLE_CHDIR
@@ -592,8 +699,14 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)
     if (orig_func == NULL) {
         orig_func = (orig_readlink_func_type)dlsym(RTLD_NEXT, "readlink");
     }
-    // Do not post-process symlink target; return exact bytes from filesystem
-    return orig_func(in, buf, bufsiz);
+    ssize_t n = orig_func(in, buf, bufsiz);
+    if (g_config.reverse_enabled) {
+        // Virtualize /proc/*/cwd result uniformly, otherwise fall back to generic reverse
+        ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+        if (nv != n) return nv;
+        return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+    }
+    return n;
 }
 
 typedef ssize_t (*orig_readlinkat_func_type)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
@@ -608,8 +721,13 @@ ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
     if (orig_func == NULL) {
         orig_func = (orig_readlinkat_func_type)dlsym(RTLD_NEXT, "readlinkat");
     }
-    // Do not post-process symlink target; return exact bytes from filesystem
-    return orig_func(dirfd, in, buf, bufsiz);
+    ssize_t n = orig_func(dirfd, in, buf, bufsiz);
+    if (g_config.reverse_enabled) {
+        ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+        if (nv != n) return nv;
+        return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+    }
+    return n;
 }
 
 // glibc FORTIFY wrappers may bypass our readlink/readlinkat unless we interpose them too
@@ -625,10 +743,23 @@ ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t bu
         if (orig_func == NULL) {
             // Fallback to plain readlink if fortified symbol not found
             orig_readlink_func_type f = (orig_readlink_func_type)dlsym(RTLD_NEXT, "readlink");
-            return f ? f(in, buf, bufsiz) : -1;
+            if (!f) return -1;
+            ssize_t n = f(in, buf, bufsiz);
+            if (g_config.reverse_enabled) {
+                ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+                if (nv != n) return nv;
+                return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+            }
+            return n;
         }
     }
-    return orig_func(in, buf, bufsiz, buflen);
+    ssize_t n = orig_func(in, buf, bufsiz, buflen);
+    if (g_config.reverse_enabled) {
+        ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+        if (nv != n) return nv;
+        return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+    }
+    return n;
 }
 
 typedef ssize_t (*orig___readlinkat_chk_func_type)(int dirfd, const char *pathname, char *buf, size_t bufsiz, size_t buflen);
@@ -644,10 +775,23 @@ ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufs
         orig_func = (orig___readlinkat_chk_func_type)dlsym(RTLD_NEXT, "__readlinkat_chk");
         if (orig_func == NULL) {
             orig_readlinkat_func_type f = (orig_readlinkat_func_type)dlsym(RTLD_NEXT, "readlinkat");
-            return f ? f(dirfd, in, buf, bufsiz) : -1;
+            if (!f) return -1;
+            ssize_t n = f(dirfd, in, buf, bufsiz);
+            if (g_config.reverse_enabled) {
+                ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+                if (nv != n) return nv;
+                return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+            }
+            return n;
         }
     }
-    return orig_func(dirfd, in, buf, bufsiz, buflen);
+    ssize_t n = orig_func(dirfd, in, buf, bufsiz, buflen);
+    if (g_config.reverse_enabled) {
+        ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
+        if (nv != n) return nv;
+        return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
+    }
+    return n;
 }
 #endif // DISABLE_READLINK
 
@@ -660,9 +804,9 @@ int symlink(const char *target, const char *linkpath)
     // Map linkpath fully via fix_path
     char lbuf[MAX_PATH];
     const char *new_link = fix_path("symlink-link", linkpath, lbuf, sizeof lbuf);
-    // Map target forward without forcing absolute: use apply_mapping directly
+    // Map target forward without forcing absolute: use common mapping directly
     char tout[MAX_PATH];
-    const char *new_target = pm_apply_mapping_pairs(target, (const char *(*)[2])path_map, path_map_length, tout, sizeof tout);
+    const char *new_target = pm_apply_mapping_with_config(target, tout, sizeof tout, &g_config.mapping_config);
     static orig_symlink_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_symlink_func_type)dlsym(RTLD_NEXT, "symlink");
@@ -679,9 +823,9 @@ int symlinkat(const char *target, int newdirfd, const char *linkpath)
     const char *abs_link = absolute_from_dirfd(newdirfd, linkpath, absbuf, sizeof absbuf);
     char lbuf[MAX_PATH];
     const char *new_link = fix_path("symlinkat-link", abs_link, lbuf, sizeof lbuf);
-    // Map target forward directly
+    // Map target forward directly using common config
     char tout[MAX_PATH];
-    const char *new_target = pm_apply_mapping_pairs(target, (const char *(*)[2])path_map, path_map_length, tout, sizeof tout);
+    const char *new_target = pm_apply_mapping_with_config(target, tout, sizeof tout, &g_config.mapping_config);
     static orig_symlinkat_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_symlinkat_func_type)dlsym(RTLD_NEXT, "symlinkat");
@@ -694,7 +838,7 @@ static int resolve_fd_path_self(int fd, char *out, size_t out_size)
 {
     char linkp[64];
     snprintf(linkp, sizeof linkp, "/proc/self/fd/%d", fd);
-    ssize_t n = readlink(linkp, out, out_size - 1);
+    ssize_t n = pm_readlink_real(linkp, out, out_size - 1);
     if (n <= 0) return -1;
     out[n] = '\0';
     return 0;
@@ -715,8 +859,14 @@ struct dirent *readdir(DIR *dirp)
     size_t dl = strlen(dirpath);
     size_t nl = strlen(ent->d_name);
     if (dl + 1 + nl + 1 >= MAX_PATH) return ent;
-    // Skip reverse mapping for readdir - it should work with real filesystem paths
-    // readdir operates on real filesystem paths, not virtual ones
+    if (!g_config.reverse_enabled) return ent;
+    char full[MAX_PATH];
+    memcpy(full, dirpath, dl); full[dl] = '/'; memcpy(full + dl + 1, ent->d_name, nl + 1);
+    pm_normalize_path_inplace(full);
+    char out[MAX_PATH];
+    const char *virt = reverse_fix_path("readdir", full, out, sizeof out);
+    // Apply reverse rename in-place via shared helper; it safely preserves record size
+    pm_reverse_basename_apply_inplace(dirpath, ent->d_name, (size_t)nl + 1, &g_config.mapping_config);
     return ent;
 }
 #ifdef __GLIBC__
@@ -734,6 +884,13 @@ struct dirent64 *readdir64(DIR *dirp)
     size_t dl = strlen(dirpath);
     size_t nl = strlen(ent->d_name);
     if (dl + 1 + nl + 1 >= MAX_PATH) return ent;
+    if (!g_config.reverse_enabled) return ent;
+    char full[MAX_PATH];
+    memcpy(full, dirpath, dl); full[dl] = '/'; memcpy(full + dl + 1, ent->d_name, nl + 1);
+    pm_normalize_path_inplace(full);
+    char out[MAX_PATH];
+    const char *virt = reverse_fix_path("readdir64", full, out, sizeof out);
+    pm_reverse_basename_apply_inplace(dirpath, ent->d_name, (size_t)nl + 1, &g_config.mapping_config);
     return ent;
 }
 #endif
@@ -782,7 +939,20 @@ OVERRIDE_FUNCTION(2, 1, int, truncate64, const char *, path, off64_t, length)
 OVERRIDE_FUNCTION(2, 1, int, utime, const char *, filename, const struct utimbuf *, times)
 OVERRIDE_FUNCTION(2, 1, int, utimes, const char *, filename, const struct timeval *, tvp)
 OVERRIDE_FUNCTION(2, 1, int, lutime, const char *, filename, const struct utimbuf *, tvp)
-OVERRIDE_FUNCTION(4, 2, int, utimensat, int, dirfd, const char *, pathname, const struct timespec *, times, int, flags)
+typedef int (*orig_utimensat_func_type)(int dirfd, const char *pathname, const struct timespec *times, int flags);
+int utimensat(int dirfd, const char *pathname, const struct timespec *times, int flags)
+{
+    debug_fprintf(stderr, "utimensat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("utimensat", abs, buffer, sizeof buffer);
+    static orig_utimensat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_utimensat_func_type)dlsym(RTLD_NEXT, "utimensat");
+    }
+    return orig_func(dirfd, new_path, times, flags);
+}
 typedef int (*orig_futimesat_func_type)(int dirfd, const char *pathname, const struct timeval times[2]);
 int futimesat(int dirfd, const char *pathname, const struct timeval times[2])
 {
@@ -802,14 +972,40 @@ int futimesat(int dirfd, const char *pathname, const struct timeval times[2])
 
 #ifndef DISABLE_CHMOD
 OVERRIDE_FUNCTION(2, 1, int, chmod, const char *, pathname, mode_t, mode)
-OVERRIDE_FUNCTION(4, 2, int, fchmodat, int, dirfd, const char *, pathname, mode_t, mode, int, flags)
+typedef int (*orig_fchmodat_func_type)(int dirfd, const char *pathname, mode_t mode, int flags);
+int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags)
+{
+    debug_fprintf(stderr, "fchmodat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("fchmodat", abs, buffer, sizeof buffer);
+    static orig_fchmodat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_fchmodat_func_type)dlsym(RTLD_NEXT, "fchmodat");
+    }
+    return orig_func(dirfd, new_path, mode, flags);
+}
 #endif // DISABLE_CHMOD
 
 
 #ifndef DISABLE_CHOWN
 OVERRIDE_FUNCTION(3, 1, int, chown, const char *, pathname, uid_t, owner, gid_t, group)
 OVERRIDE_FUNCTION(3, 1, int, lchown, const char *, pathname, uid_t, owner, gid_t, group)
-OVERRIDE_FUNCTION(5, 2, int, fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flags)
+typedef int (*orig_fchownat_func_type)(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags);
+int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags)
+{
+    debug_fprintf(stderr, "fchownat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("fchownat", abs, buffer, sizeof buffer);
+    static orig_fchownat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_fchownat_func_type)dlsym(RTLD_NEXT, "fchownat");
+    }
+    return orig_func(dirfd, new_path, owner, group, flags);
+}
 #endif // DISABLE_CHOWN
 
 
@@ -887,7 +1083,30 @@ int execvp(const char *filename, char * const* argv)
     return execute_with_resolved_path_universal(filename, final_path, argv, NULL, orig_execvp_func, 0);
 }
 OVERRIDE_FUNCTION(3, 1, int, execvpe, const char *, filename, char * const*, argv, char * const*, env)
-OVERRIDE_FUNCTION(5, 2, int, execveat, int, dirfd, const char *, pathname, char * const*, argv, char * const*, env, int, flags)
+typedef int (*orig_execveat_func_type)(int dirfd, const char *pathname, char * const* argv, char * const* env, int flags);
+int execveat(int dirfd, const char *pathname, char * const* argv, char * const* env, int flags)
+{
+    debug_fprintf(stderr, "execveat(%s) called\n", pathname);
+    const char *orig_path = pathname;
+    char absbuf[MAX_PATH];
+    const char *abs = pathname;
+    if (!(flags & AT_EMPTY_PATH)) {
+        abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    }
+    char buffer[MAX_PATH];
+    const char *final_path = fix_path("execveat", abs, buffer, sizeof buffer);
+    static orig_execveat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_execveat_func_type)dlsym(RTLD_NEXT, "execveat");
+    }
+    char **new_argv = update_argv0(orig_path, final_path, argv);
+    if (new_argv != NULL) {
+        int result = orig_func(dirfd, final_path, new_argv, env, flags);
+        pm_free_argv0(new_argv, final_path);
+        return result;
+    }
+    return orig_func(dirfd, final_path, argv, env, flags);
+}
 
 int execl(const char *filename, const char *arg0, ...)
 {
@@ -1023,9 +1242,12 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 {
     debug_fprintf(stderr, "renameat(%s, %s) called\n", oldpath, newpath);
 
+    char abs1[MAX_PATH], abs2[MAX_PATH];
+    const char *a_old = absolute_from_dirfd(olddirfd, oldpath, abs1, sizeof abs1);
+    const char *a_new = absolute_from_dirfd(newdirfd, newpath, abs2, sizeof abs2);
     char buffer[MAX_PATH], buffer2[MAX_PATH];
-    const char *new_oldpath = fix_path("renameat-old", oldpath, buffer, sizeof buffer);
-    const char *new_newpath = fix_path("renameat-new", newpath, buffer2, sizeof buffer2);
+    const char *new_oldpath = fix_path("renameat-old", a_old, buffer, sizeof buffer);
+    const char *new_newpath = fix_path("renameat-new", a_new, buffer2, sizeof buffer2);
 
     static orig_renameat_func_type orig_func = NULL;
     if (orig_func == NULL) {
@@ -1040,9 +1262,12 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpa
 {
     debug_fprintf(stderr, "renameat2(%s, %s) called\n", oldpath, newpath);
 
+    char abs1[MAX_PATH], abs2[MAX_PATH];
+    const char *a_old = absolute_from_dirfd(olddirfd, oldpath, abs1, sizeof abs1);
+    const char *a_new = absolute_from_dirfd(newdirfd, newpath, abs2, sizeof abs2);
     char buffer[MAX_PATH], buffer2[MAX_PATH];
-    const char *new_oldpath = fix_path("renameat2-old", oldpath, buffer, sizeof buffer);
-    const char *new_newpath = fix_path("renameat2-new", newpath, buffer2, sizeof buffer2);
+    const char *new_oldpath = fix_path("renameat2-old", a_old, buffer, sizeof buffer);
+    const char *new_newpath = fix_path("renameat2-new", a_new, buffer2, sizeof buffer2);
 
     static orig_renameat2_func_type orig_func = NULL;
     if (orig_func == NULL) {
@@ -1059,8 +1284,10 @@ typedef int (*orig_name_to_handle_at_func_type)(int dirfd, const char *pathname,
 int name_to_handle_at(int dirfd, const char *pathname, struct file_handle *handle, int *mount_id, int flags)
 {
     debug_fprintf(stderr, "name_to_handle_at(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
     char buffer[MAX_PATH];
-    const char *new_path = fix_path("name_to_handle_at", pathname, buffer, sizeof buffer);
+    const char *new_path = fix_path("name_to_handle_at", abs, buffer, sizeof buffer);
     static orig_name_to_handle_at_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_name_to_handle_at_func_type)dlsym(RTLD_NEXT, "name_to_handle_at");
@@ -1086,8 +1313,10 @@ typedef int (*orig_open_tree_func_type)(int dfd, const char *filename, unsigned 
 int open_tree(int dfd, const char *filename, unsigned int flags)
 {
     debug_fprintf(stderr, "open_tree(%s) called\n", filename);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dfd, filename, absbuf, sizeof absbuf);
     char buffer[MAX_PATH];
-    const char *new_path = fix_path("open_tree", filename, buffer, sizeof buffer);
+    const char *new_path = fix_path("open_tree", abs, buffer, sizeof buffer);
     static orig_open_tree_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_open_tree_func_type)dlsym(RTLD_NEXT, "open_tree");
@@ -1101,10 +1330,13 @@ int open_tree(int dfd, const char *filename, unsigned int flags)
 typedef int (*orig_move_mount_func_type)(int from_dfd, const char *from_pathname, int to_dfd, const char *to_pathname, unsigned int flags);
 int move_mount(int from_dfd, const char *from_pathname, int to_dfd, const char *to_pathname, unsigned int flags)
 {
-    debug_fprintf(stderr, "move_mount(%s -> %s) called\n", from_pathname, to_pathname);
+    debug_fprintf(stderr, "move_mount(%s => %s) called\n", from_pathname, to_pathname);
+    char abs1[MAX_PATH], abs2[MAX_PATH];
+    const char *a_from = absolute_from_dirfd(from_dfd, from_pathname, abs1, sizeof abs1);
+    const char *a_to = absolute_from_dirfd(to_dfd, to_pathname, abs2, sizeof abs2);
     char buf1[MAX_PATH], buf2[MAX_PATH];
-    const char *new_from = fix_path("move_mount-from", from_pathname, buf1, sizeof buf1);
-    const char *new_to = fix_path("move_mount-to", to_pathname, buf2, sizeof buf2);
+    const char *new_from = fix_path("move_mount-from", a_from, buf1, sizeof buf1);
+    const char *new_to = fix_path("move_mount-to", a_to, buf2, sizeof buf2);
     static orig_move_mount_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_move_mount_func_type)dlsym(RTLD_NEXT, "move_mount");
@@ -1119,8 +1351,10 @@ typedef int (*orig_mount_setattr_func_type)(int dfd, const char *path, unsigned 
 int mount_setattr(int dfd, const char *path, unsigned int flags, struct mount_attr *attr, size_t size)
 {
     debug_fprintf(stderr, "mount_setattr(%s) called\n", path);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dfd, path, absbuf, sizeof absbuf);
     char buffer[MAX_PATH];
-    const char *new_path = fix_path("mount_setattr", path, buffer, sizeof buffer);
+    const char *new_path = fix_path("mount_setattr", abs, buffer, sizeof buffer);
     static orig_mount_setattr_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_mount_setattr_func_type)dlsym(RTLD_NEXT, "mount_setattr");
@@ -1136,8 +1370,10 @@ typedef int (*orig_statmount_func_type)(int dirfd, const char *pathname, struct 
 int statmount(int dirfd, const char *pathname, struct statmount *buf, size_t bufsize, unsigned int flags)
 {
     debug_fprintf(stderr, "statmount(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
     char buffer[MAX_PATH];
-    const char *new_path = fix_path("statmount", pathname, buffer, sizeof buffer);
+    const char *new_path = fix_path("statmount", abs, buffer, sizeof buffer);
     static orig_statmount_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_statmount_func_type)dlsym(RTLD_NEXT, "statmount");
@@ -1223,9 +1459,12 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
 {
     debug_fprintf(stderr, "linkat(%s, %s) called\n", oldpath, newpath);
 
+    char abs1[MAX_PATH], abs2[MAX_PATH];
+    const char *a_old = absolute_from_dirfd(olddirfd, oldpath, abs1, sizeof abs1);
+    const char *a_new = absolute_from_dirfd(newdirfd, newpath, abs2, sizeof abs2);
     char buffer[MAX_PATH], buffer2[MAX_PATH];
-    const char *new_oldpath = fix_path("linkat-old", oldpath, buffer, sizeof buffer);
-    const char *new_newpath = fix_path("linkat-new", newpath, buffer2, sizeof buffer2);
+    const char *new_oldpath = fix_path("linkat-old", a_old, buffer, sizeof buffer);
+    const char *new_newpath = fix_path("linkat-new", a_new, buffer2, sizeof buffer2);
 
     static orig_linkat_func_type orig_func = NULL;
     if (orig_func == NULL) {
@@ -1243,11 +1482,115 @@ typedef int (*scandir_filter_t)(const struct dirent *);
 typedef int (*scandir_compar_t)(const struct dirent **, const struct dirent **);
 typedef int (*scandir64_filter_t)(const struct dirent64 *);
 typedef int (*scandir64_compar_t)(const struct dirent64 **, const struct dirent64 **);
-OVERRIDE_FUNCTION(4, 1, int, scandir, const char *, dirp, struct dirent ***, namelist, scandir_filter_t, filter, scandir_compar_t, compar)
-OVERRIDE_FUNCTION(5, 2, int, scandirat, int, dirfd, const char *, dirp, struct dirent ***, namelist, scandir_filter_t, filter, scandir_compar_t, compar)
+
+typedef int (*orig_scandir_func_type)(const char *dirp, struct dirent ***namelist, scandir_filter_t filter, scandir_compar_t compar);
+int scandir(const char *dirp, struct dirent ***namelist, scandir_filter_t filter, scandir_compar_t compar)
+{
+    debug_fprintf(stderr, "scandir(%s) called\n", dirp);
+    char buffer[MAX_PATH];
+    const char *new_dir = fix_path("scandir", dirp, buffer, sizeof buffer);
+    static orig_scandir_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_scandir_func_type)dlsym(RTLD_NEXT, "scandir");
+    }
+    int n = orig_func(new_dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    if (!g_config.reverse_enabled) return n;
+    for (int i = 0; i < n; i++) {
+        struct dirent *ent = (*namelist)[i];
+        if (!ent) continue;
+        size_t nl = strlen(ent->d_name);
+        char newname_buf[NAME_MAX > 0 ? NAME_MAX + 1 : 256];
+        int newlen_int = pm_reverse_basename_from_dir(new_dir, ent->d_name, newname_buf, sizeof newname_buf, &g_config.mapping_config);
+        if (newlen_int < 0) continue;
+        size_t newlen = (size_t)newlen_int;
+        if (newlen <= nl) memcpy(ent->d_name, newname_buf, newlen + 1);
+    }
+    return n;
+}
+
+typedef int (*orig_scandirat_func_type)(int dirfd, const char *dirp, struct dirent ***namelist, scandir_filter_t filter, scandir_compar_t compar);
+int scandirat(int dirfd, const char *dirp, struct dirent ***namelist, scandir_filter_t filter, scandir_compar_t compar)
+{
+    debug_fprintf(stderr, "scandirat(%s) called\n", dirp);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, dirp, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_dir = fix_path("scandirat", abs, buffer, sizeof buffer);
+    static orig_scandirat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_scandirat_func_type)dlsym(RTLD_NEXT, "scandirat");
+    }
+    int n = orig_func(dirfd, new_dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    if (!g_config.reverse_enabled) return n;
+    for (int i = 0; i < n; i++) {
+        struct dirent *ent = (*namelist)[i];
+        if (!ent) continue;
+        size_t nl = strlen(ent->d_name);
+        char newname_buf[NAME_MAX > 0 ? NAME_MAX + 1 : 256];
+        int newlen_int = pm_reverse_basename_from_dir(new_dir, ent->d_name, newname_buf, sizeof newname_buf, &g_config.mapping_config);
+        if (newlen_int < 0) continue;
+        size_t newlen = (size_t)newlen_int;
+        if (newlen <= nl) memcpy(ent->d_name, newname_buf, newlen + 1);
+    }
+    return n;
+}
+
 #ifdef __GLIBC__
-OVERRIDE_FUNCTION(4, 1, int, scandir64, const char *, dirp, struct dirent64 ***, namelist, scandir64_filter_t, filter, scandir64_compar_t, compar)
-OVERRIDE_FUNCTION(5, 2, int, scandirat64, int, dirfd, const char *, dirp, struct dirent64 ***, namelist, scandir64_filter_t, filter, scandir64_compar_t, compar)
+typedef int (*orig_scandir64_func_type)(const char *dirp, struct dirent64 ***namelist, scandir64_filter_t filter, scandir64_compar_t compar);
+int scandir64(const char *dirp, struct dirent64 ***namelist, scandir64_filter_t filter, scandir64_compar_t compar)
+{
+    debug_fprintf(stderr, "scandir64(%s) called\n", dirp);
+    char buffer[MAX_PATH];
+    const char *new_dir = fix_path("scandir64", dirp, buffer, sizeof buffer);
+    static orig_scandir64_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_scandir64_func_type)dlsym(RTLD_NEXT, "scandir64");
+    }
+    int n = orig_func(new_dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    if (!g_config.reverse_enabled) return n;
+    for (int i = 0; i < n; i++) {
+        struct dirent64 *ent = (*namelist)[i];
+        if (!ent) continue;
+        size_t nl = strlen(ent->d_name);
+        char newname_buf[NAME_MAX > 0 ? NAME_MAX + 1 : 256];
+        int newlen_int = pm_reverse_basename_from_dir(new_dir, ent->d_name, newname_buf, sizeof newname_buf, &g_config.mapping_config);
+        if (newlen_int < 0) continue;
+        size_t newlen = (size_t)newlen_int;
+        if (newlen <= nl) memcpy(ent->d_name, newname_buf, newlen + 1);
+    }
+    return n;
+}
+
+typedef int (*orig_scandirat64_func_type)(int dirfd, const char *dirp, struct dirent64 ***namelist, scandir64_filter_t filter, scandir64_compar_t compar);
+int scandirat64(int dirfd, const char *dirp, struct dirent64 ***namelist, scandir64_filter_t filter, scandir64_compar_t compar)
+{
+    debug_fprintf(stderr, "scandirat64(%s) called\n", dirp);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, dirp, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_dir = fix_path("scandirat64", abs, buffer, sizeof buffer);
+    static orig_scandirat64_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_scandirat64_func_type)dlsym(RTLD_NEXT, "scandirat64");
+    }
+    int n = orig_func(dirfd, new_dir, namelist, filter, compar);
+    if (n <= 0) return n;
+    if (!g_config.reverse_enabled) return n;
+    for (int i = 0; i < n; i++) {
+        struct dirent64 *ent = (*namelist)[i];
+        if (!ent) continue;
+        size_t nl = strlen(ent->d_name);
+        char newname_buf[NAME_MAX > 0 ? NAME_MAX + 1 : 256];
+        int newlen_int = pm_reverse_basename_from_dir(new_dir, ent->d_name, newname_buf, sizeof newname_buf, &g_config.mapping_config);
+        if (newlen_int < 0) continue;
+        size_t newlen = (size_t)newlen_int;
+        if (newlen <= nl) memcpy(ent->d_name, newname_buf, newlen + 1);
+    }
+    return n;
+}
 #endif
 #endif // DISABLE_SCANDIR
 
@@ -1266,7 +1609,25 @@ OVERRIDE_FUNCTION(2, 1, int, lstat64, const char *, path, struct stat64 *, buf)
 
 
 #ifndef DISABLE_STATX
-OVERRIDE_FUNCTION(5, 2, int, statx, int, dirfd, const char *, pathname, int, flags, unsigned int, mask, struct statx *, statxbuf)
+typedef int (*orig_statx_func_type)(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf);
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask, struct statx *statxbuf)
+{
+    debug_fprintf(stderr, "statx(%s) called\n", pathname);
+    // Preserve AT_EMPTY_PATH semantics: when set, pathname is ignored and the
+    // call applies to the file referred by dirfd. Do not rewrite pathname.
+    static orig_statx_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_statx_func_type)dlsym(RTLD_NEXT, "statx");
+    }
+    if (flags & AT_EMPTY_PATH) {
+        return orig_func(dirfd, pathname, flags, mask, statxbuf);
+    }
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("statx", abs, buffer, sizeof buffer);
+    return orig_func(dirfd, new_path, flags, mask, statxbuf);
+}
 #endif // DISABLE_STATX
 
 
@@ -1338,9 +1699,39 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
 
 
 #ifndef DISABLE_DLOPEN
-OVERRIDE_FUNCTION(2, 1, void *, dlopen, const char *, filename, int, flag)
+typedef void *(*orig_dlopen_func_type)(const char *filename, int flag);
+void *dlopen(const char *filename, int flag)
+{
+    debug_fprintf(stderr, "dlopen(%s) called\n", filename ? filename : "(null)");
+    static orig_dlopen_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_dlopen_func_type)dlsym(RTLD_NEXT, "dlopen");
+    }
+    // Preserve default loader search when no slash in name
+    if (!filename || !strchr(filename, '/')) {
+        return orig_func(filename, flag);
+    }
+    // Absolute or relative with slash: apply mapping
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("dlopen", filename, buffer, sizeof buffer);
+    return orig_func(new_path, flag);
+}
 #ifdef __GLIBC__
-OVERRIDE_FUNCTION(3, 2, void *, dlmopen, Lmid_t, lmid, const char *, filename, int, flag)
+typedef void *(*orig_dlmopen_func_type)(Lmid_t lmid, const char *filename, int flag);
+void *dlmopen(Lmid_t lmid, const char *filename, int flag)
+{
+    debug_fprintf(stderr, "dlmopen(%s) called\n", filename ? filename : "(null)");
+    static orig_dlmopen_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_dlmopen_func_type)dlsym(RTLD_NEXT, "dlmopen");
+    }
+    if (!filename || !strchr(filename, '/')) {
+        return orig_func(lmid, filename, flag);
+    }
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("dlmopen", filename, buffer, sizeof buffer);
+    return orig_func(lmid, new_path, flag);
+}
 #endif
 #endif // DISABLE_DLOPEN
 

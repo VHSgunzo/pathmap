@@ -20,10 +20,11 @@ static void test_missing_colon_returns_error_buf(void)
     char *buffer = NULL;
     int pairs_len = 0;
     int rc = pm_parse_path_mapping_env("/from-only" , &linear, &pairs_len, &buffer);
-    assert(rc != 0);
-    assert(linear == NULL);
+    // Parser now skips invalid entries and returns success with zero pairs
+    assert(rc == 0);
     assert(pairs_len == 0);
-    assert(buffer == NULL);
+    if (linear) free(linear);
+    if (buffer) free(buffer);
 }
 
 static void test_even_pairs_ok(void)

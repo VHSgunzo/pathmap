@@ -27,6 +27,12 @@
 // Use common configuration structure
 static struct pm_common_config g_config;
 static const char *g_current_syscall = NULL; /* debug context */
+// Track whether we already attempted startup CWD fix per pid
+static pid_t g_cwdfix_pids[1024];
+static unsigned char g_cwdfix_state[1024]; /* 0=unset, 1=pending, 2=done */
+static int g_cwdfix_count = 0;
+static int cwdfix_find(pid_t p) { for (int i = 0; i < g_cwdfix_count; i++) if (g_cwdfix_pids[i] == p) return i; return -1; }
+static int cwdfix_get_or_add(pid_t p) { int i = cwdfix_find(p); if (i < 0 && g_cwdfix_count < 1024) { i = g_cwdfix_count++; g_cwdfix_pids[i] = p; g_cwdfix_state[i] = 0; } return i; }
 
 static void cleanup_config(void)
 {
@@ -72,6 +78,7 @@ typedef struct user_regs_struct TraceRegs;
 static inline int regs_read(pid_t pid, TraceRegs *r) { return ptrace(PTRACE_GETREGS, pid, NULL, r); }
 static inline int regs_write(pid_t pid, const TraceRegs *r) { return g_config.dry_run ? 0 : ptrace(PTRACE_SETREGS, pid, NULL, (void *)r); }
 static inline long get_sysno(const TraceRegs *r) { return (long)r->orig_rax; }
+static inline void set_sysno(TraceRegs *r, long sysno) { r->orig_rax = (unsigned long)sysno; }
 static inline unsigned long get_arg(const TraceRegs *r, int idx) {
     switch (idx) { case 0: return r->rdi; case 1: return r->rsi; case 2: return r->rdx; case 3: return r->r10; case 4: return r->r8; case 5: return r->r9; }
     return 0;
@@ -88,6 +95,7 @@ typedef struct user_pt_regs TraceRegs;
 static inline int regs_read(pid_t pid, TraceRegs *r) { struct iovec iov = { .iov_base = r, .iov_len = sizeof(*r) }; return ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov); }
 static inline int regs_write(pid_t pid, const TraceRegs *r) { if (g_config.dry_run) return 0; struct iovec iov = { .iov_base = (void *)r, .iov_len = sizeof(*r) }; return ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov); }
 static inline long get_sysno(const TraceRegs *r) { return (long)r->regs[8]; }
+static inline void set_sysno(TraceRegs *r, long sysno) { r->regs[8] = (unsigned long)sysno; }
 static inline unsigned long get_arg(const TraceRegs *r, int idx) { return (idx>=0 && idx<=5)? r->regs[idx] : 0; }
 static inline void set_arg(TraceRegs *r, int idx, unsigned long v) { if (idx>=0 && idx<=5) r->regs[idx] = v; }
 static inline unsigned long get_sp(const TraceRegs *r) { return (unsigned long)r->sp; }
@@ -100,6 +108,7 @@ typedef struct riscv_user_regs_proxy TraceRegs;
 static inline int regs_read(pid_t pid, TraceRegs *r) { struct iovec iov = { .iov_base = r, .iov_len = sizeof(*r) }; return ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov); }
 static inline int regs_write(pid_t pid, const TraceRegs *r) { if (g_config.dry_run) return 0; struct iovec iov = { .iov_base = (void *)r, .iov_len = sizeof(*r) }; return ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov); }
 static inline long get_sysno(const TraceRegs *r) { return (long)r->a7; }
+static inline void set_sysno(TraceRegs *r, long sysno) { r->a7 = (unsigned long)sysno; }
 static inline unsigned long get_arg(const TraceRegs *r, int idx) { switch(idx){case 0:return r->a0;case 1:return r->a1;case 2:return r->a2;case 3:return r->a3;case 4:return r->a4;case 5:return r->a5;} return 0; }
 static inline void set_arg(TraceRegs *r, int idx, unsigned long v) { switch(idx){case 0:r->a0=v;break;case 1:r->a1=v;break;case 2:r->a2=v;break;case 3:r->a3=v;break;case 4:r->a4=v;break;case 5:r->a5=v;break;} }
 static inline unsigned long get_sp(const TraceRegs *r) { return (unsigned long)r->sp; }
@@ -180,7 +189,30 @@ static void remap_arg_path_with_stack_fallback(pid_t pid, TraceRegs *regs, enum 
 	char buf[MAX_PATH];
 	if (read_string(pid, paddr, buf, sizeof buf) != 0) return;
 	size_t orig_len = strlen(buf);
+	// Do not remap the literal current directory
+	if (orig_len == 1 && buf[0] == '.') return;
+	int original_was_absolute = (orig_len > 0 && buf[0] == '/');
 	if (buf[0] == '/') pm_normalize_path_inplace(buf); else resolve_relative_for_pid(buf, sizeof buf, pid, dirfd);
+	// Skip mapping for paths inside real CWD if CWD maps to a non-directory (e.g., /dev/null)
+	if (!original_was_absolute) {
+		char rcwd[MAX_PATH];
+		char linkp[64];
+		snprintf(linkp, sizeof linkp, "/proc/%d/cwd", pid);
+		ssize_t rn = readlink(linkp, rcwd, sizeof rcwd - 1);
+		if (rn > 0) {
+			rcwd[rn] = '\0';
+			pm_normalize_path_inplace(rcwd);
+			char mapped_cwd[MAX_PATH];
+			const char *mrcwd = pm_apply_mapping_with_config(rcwd, mapped_cwd, sizeof mapped_cwd, &g_config.mapping_config);
+			if (mrcwd != rcwd && !pm_real_stat_is_dir(mrcwd)) {
+				// If buf is under rcwd (with boundary), skip mapping
+				size_t rl = strlen(rcwd);
+				if ((strncmp(buf, rcwd, rl) == 0) && (buf[rl] == '/' || buf[rl] == '\0')) {
+					return;
+				}
+			}
+		}
+	}
 	if (is_excluded_prefix(buf)) { return; }
 	char out[MAX_PATH];
 	const char *mapped = apply_mapping(buf, out, sizeof out);
@@ -188,38 +220,18 @@ static void remap_arg_path_with_stack_fallback(pid_t pid, TraceRegs *regs, enum 
 
 	// Resolve symlinks with virtual directory support
 	char resolved_buffer[MAX_PATH];
+	const char *final_path = mapped;
 	if (pm_should_resolve_symlink(g_current_syscall, g_config.relsymlink)) {
-		const char *final_path = pm_resolve_symlink_path_impl(buf, mapped, resolved_buffer, sizeof resolved_buffer, &g_config.mapping_config);
-		if (final_path != mapped) {
-			// Symlink resolution applied, use resolved path
-			if (g_config.dry_run) { if (g_config.debug) fprintf(stderr, "[pathmap] dry-run: '%s' -> '%s' (symlink resolved, no write)\n", buf, final_path); return; }
-			if (write_string_if_fits(pid, paddr, final_path, orig_len) == 0) {
-				if (g_config.debug) fprintf(stderr, "[pathmap] in-place: '%s' -> '%s' (symlink resolved)\n", buf, final_path);
-				return;
-			}
-			// Fallback: place on stack and retarget argument register
-			unsigned long new_addr = 0;
-			if (write_string_on_stack(pid, regs, final_path, &new_addr) == 0) {
-				set_reg_by_sel(regs, sel, new_addr);
-				if (!g_config.dry_run) ptrace(PTRACE_SETREGS, pid, NULL, regs);
-				if (g_config.debug) fprintf(stderr, "[pathmap] stack: '%s' -> '%s' (symlink resolved) @0x%lx\n", buf, final_path, new_addr);
-			}
-			return;
-		}
+		const char *fp = pm_resolve_symlink_path_impl(buf, mapped, resolved_buffer, sizeof resolved_buffer, &g_config.mapping_config);
+		if (fp != mapped) final_path = fp;
 	}
-
-	// No symlink resolution needed, use mapped path
-	if (g_config.dry_run) { if (g_config.debug) fprintf(stderr, "[pathmap] dry-run: '%s' -> '%s' (no write)\n", buf, mapped); return; }
-	if (write_string_if_fits(pid, paddr, mapped, orig_len) == 0) {
-		if (g_config.debug) fprintf(stderr, "[pathmap] in-place: '%s' -> '%s'\n", buf, mapped);
-		return;
-	}
-	// Fallback: place on stack and retarget argument register
+	// To match preload behavior, avoid mutating original user memory; always place mapped path on stack
+	if (g_config.dry_run) { if (g_config.debug) fprintf(stderr, "[pathmap] dry-run: '%s' -> '%s' (stack)\n", buf, final_path); return; }
 	unsigned long new_addr = 0;
-	if (write_string_on_stack(pid, regs, mapped, &new_addr) == 0) {
+	if (write_string_on_stack(pid, regs, final_path, &new_addr) == 0) {
 		set_reg_by_sel(regs, sel, new_addr);
 		if (!g_config.dry_run) ptrace(PTRACE_SETREGS, pid, NULL, regs);
-		if (g_config.debug) fprintf(stderr, "[pathmap] stack: '%s' -> '%s' @0x%lx\n", buf, mapped, new_addr);
+		if (g_config.debug) fprintf(stderr, "[pathmap] stack: '%s' -> '%s' @0x%lx\n", buf, final_path, new_addr);
 	}
 }
 
@@ -234,10 +246,34 @@ static void remap_pair_paths_with_stack(pid_t pid, TraceRegs *regs,
 	if (read_string(pid, a1, b1, sizeof b1) != 0) return;
 	if (read_string(pid, a2, b2, sizeof b2) != 0) return;
 	size_t o1 = strlen(b1), o2 = strlen(b2);
+	int o1_abs = (o1 > 0 && b1[0] == '/');
+	int o2_abs = (o2 > 0 && b2[0] == '/');
 	if (b1[0] == '/') pm_normalize_path_inplace(b1); else resolve_relative_for_pid(b1, sizeof b1, pid, dirfd1);
 	if (b2[0] == '/') pm_normalize_path_inplace(b2); else resolve_relative_for_pid(b2, sizeof b2, pid, dirfd2);
+	// Skip mapping for paths inside real CWD if CWD maps to a non-directory
+	if (!o1_abs || !o2_abs) {
+		char rcwd[MAX_PATH];
+		char linkp[64];
+		snprintf(linkp, sizeof linkp, "/proc/%d/cwd", pid);
+		ssize_t rn = readlink(linkp, rcwd, sizeof rcwd - 1);
+		if (rn > 0) {
+			rcwd[rn] = '\0'; pm_normalize_path_inplace(rcwd);
+			char mapped_cwd[MAX_PATH];
+			const char *mrcwd = pm_apply_mapping_with_config(rcwd, mapped_cwd, sizeof mapped_cwd, &g_config.mapping_config);
+			if (mrcwd != rcwd && !pm_real_stat_is_dir(mrcwd)) {
+				size_t rl = strlen(rcwd);
+				int under1 = (!o1_abs) && (strncmp(b1, rcwd, rl) == 0) && (b1[rl] == '/' || b1[rl] == '\0');
+				int under2 = (!o2_abs) && (strncmp(b2, rcwd, rl) == 0) && (b2[rl] == '/' || b2[rl] == '\0');
+				// We'll suppress mapping later by treating them as excluded
+				if (under1) { /* mark via sentinel by setting o1_abs=2 */ o1_abs = 2; }
+				if (under2) { o2_abs = 2; }
+			}
+		}
+	}
 	int ex1 = is_excluded_prefix(b1);
 	int ex2 = is_excluded_prefix(b2);
+	if (o1_abs == 2) ex1 = 1; // suppress mapping for 1
+	if (o2_abs == 2) ex2 = 1; // suppress mapping for 2
 	/* per-call exclude logs removed; printed once at init */
 	if (ex1 && ex2) return;
 	char m1[MAX_PATH], m2[MAX_PATH];
@@ -408,10 +444,14 @@ static void maybe_remap_path(pid_t pid, long sysno, TraceRegs *regs)
 	} else if (sysno == SYS_execve) {
 		g_current_syscall = "execve";
 		remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD);
+		// Keep argv[0] consistent with preload: mapped(argv0) without symlink resolution
+		try_update_argv0(pid, regs, ARG_RSI, NULL, NULL);
 		return;
 	} else if (sysno == SYS_execveat) {
 		g_current_syscall = "execveat";
 		remap_arg_path_with_stack_fallback(pid, regs, ARG_RSI, (int)get_arg(regs,0));
+		// argv pointer is arg2 (RDX) on x86_64 for execveat
+		try_update_argv0(pid, regs, ARG_RDX, NULL, NULL);
 		return;
 	} else if (sysno == SYS_statx) {
 		g_current_syscall = "statx";
@@ -424,6 +464,30 @@ static void maybe_remap_path(pid_t pid, long sysno, TraceRegs *regs)
 	} else if (sysno == SYS_lstat) {
 		g_current_syscall = "lstat";
 		remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD);
+		return;
+	} else if (sysno == SYS_readlink) {
+		g_current_syscall = "readlink";
+		unsigned long paddr = get_arg(regs, 0);
+		if (paddr) {
+			char pbuf[MAX_PATH];
+			if (read_string(pid, paddr, pbuf, sizeof pbuf) == 0) {
+				if (!pm_is_proc_cwd_path(pbuf)) {
+					remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD);
+				}
+			}
+		}
+		return;
+	} else if (sysno == SYS_readlinkat) {
+		g_current_syscall = "readlinkat";
+		unsigned long paddr = get_arg(regs, 1);
+		if (paddr) {
+			char pbuf[MAX_PATH];
+			if (read_string(pid, paddr, pbuf, sizeof pbuf) == 0) {
+				if (!pm_is_proc_cwd_path(pbuf)) {
+					remap_arg_path_with_stack_fallback(pid, regs, ARG_RSI, (int)get_arg(regs,0));
+				}
+			}
+		}
 		return;
 	} else {
 		return;
@@ -449,6 +513,40 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 {
 	long sysno = get_sysno(regs);
 	g_current_syscall = NULL;
+	// One-time startup CWD fix per tracee using common planning logic (avoid hijacking exec*)
+	if (sysno != SYS_execve
+#ifdef SYS_execveat
+	    && sysno != SYS_execveat
+#endif
+	   ) {
+		int ci = cwdfix_get_or_add(pid);
+		if (ci >= 0 && g_cwdfix_state[ci] == 0) {
+			char rcwd[MAX_PATH];
+			char linkp[64];
+			snprintf(linkp, sizeof linkp, "/proc/%d/cwd", pid);
+			ssize_t n = readlink(linkp, rcwd, sizeof rcwd - 1);
+			if (n > 0) {
+				rcwd[n] = '\0';
+				pm_normalize_path_inplace(rcwd);
+				if (pm_startup_cwd_needs_fix(rcwd, &g_config.mapping_config)) {
+					struct pm_cwd_plan plan;
+					pm_build_validated_startup_cwd_plan(rcwd, &plan, &g_config.mapping_config);
+					if (plan.have_target) {
+						unsigned long where = 0;
+						if (write_string_on_stack_with_gap(pid, regs, plan.chdir_target, 4096, &where) == 0) {
+							set_sysno(regs, SYS_chdir);
+							set_arg(regs, 0, where);
+							regs_write(pid, regs);
+							if (g_config.debug) fprintf(stderr, "[pathmap] startup cwd fix: '%s' -> '%s' (pid=%d)\n", rcwd, plan.chdir_target, pid);
+							g_cwdfix_state[ci] = 1; // pending
+							return; // let chdir run now
+						}
+					}
+				}
+				g_cwdfix_state[ci] = 2; // done/no-op
+			}
+		}
+	}
 	// Common path-taking syscalls beyond open/stat/unlink/exec handled in maybe_remap_path:
 	// rename/renameat/renameat2
 	if (sysno == SYS_rename) {
@@ -519,6 +617,9 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 #ifdef SYS_faccessat
 	if (sysno == SYS_faccessat) { g_current_syscall = "faccessat"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RSI, (int)get_arg(regs,0)); return; }
 #endif
+#ifdef SYS_faccessat2
+	if (sysno == SYS_faccessat2) { g_current_syscall = "faccessat2"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RSI, (int)get_arg(regs,0)); return; }
+#endif
 	if (sysno == SYS_getxattr) { g_current_syscall = "getxattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
 	if (sysno == SYS_lgetxattr) { g_current_syscall = "lgetxattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
 	if (sysno == SYS_setxattr) { g_current_syscall = "setxattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
@@ -527,88 +628,6 @@ static void on_sys_enter(pid_t pid, TraceRegs *regs)
 	if (sysno == SYS_lremovexattr) { g_current_syscall = "lremovexattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
 	if (sysno == SYS_listxattr) { g_current_syscall = "listxattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
 	if (sysno == SYS_llistxattr) { g_current_syscall = "llistxattr"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
-	if (sysno == SYS_readlink) {
-		g_current_syscall = "readlink";
-		// const char *pathname (rdi), char *buf (rsi), size_t bufsiz (rdx)
-		unsigned long paddr = get_arg(regs,0);
-		char path[MAX_PATH];
-		if (read_string(pid, paddr, path, sizeof path) == 0) {
-			// Normalize absolute or resolve relative
-			if (path[0] == '/') pm_normalize_path_inplace(path);
-			else resolve_relative_for_pid(path, sizeof path, pid, AT_FDCWD);
-			char out[MAX_PATH];
-			const char *mapped = apply_mapping(path, out, sizeof out);
-			if (mapped != path) {
-				// Don't write into pathname if longer; use stack
-				unsigned long new_addr = 0;
-				if (write_string_if_fits(pid, paddr, mapped, strlen(path)) != 0) {
-					if (write_string_on_stack(pid, regs, mapped, &new_addr) == 0) { set_arg(regs,0,new_addr); regs_write(pid, regs); if (g_config.debug) fprintf(stderr, "[pathmap] stack: '%s' -> '%s' @0x%lx\n", path, mapped, new_addr); }
-				}
-			}
-		}
-		return;
-	}
-	if (sysno == SYS_readlinkat) {
-		g_current_syscall = "readlinkat";
-		// int dirfd (rdi), const char *pathname (rsi), char *buf (rdx), size_t bufsiz (r10)
-		int dirfd = (int)get_arg(regs,0);
-		unsigned long paddr = get_arg(regs,1);
-		char path[MAX_PATH];
-		if (read_string(pid, paddr, path, sizeof path) == 0) {
-			resolve_relative_for_pid(path, sizeof path, pid, dirfd);
-			pm_normalize_path_inplace(path);
-			char out[MAX_PATH];
-			const char *mapped = apply_mapping(path, out, sizeof out);
-			if (mapped != path) {
-				unsigned long new_addr = 0;
-				if (write_string_if_fits(pid, paddr, mapped, strlen(path)) != 0) {
-					if (write_string_on_stack(pid, regs, mapped, &new_addr) == 0) { set_arg(regs,1,new_addr); regs_write(pid, regs); if (g_config.debug) fprintf(stderr, "[pathmap] stack: '%s' -> '%s' @0x%lx\n", path, mapped, new_addr); }
-				}
-			}
-		}
-		return;
-	}
-	// Handle exec argv[0] updates similar to LD_PRELOAD interposer behavior
-	if (sysno == SYS_execve) {
-		// filename (rdi), argv (rsi)
-		unsigned long paddr = get_arg(regs,0);
-		char orig_path[MAX_PATH];
-		if (paddr && read_string(pid, paddr, orig_path, sizeof orig_path) == 0) {
-			char raw_path[MAX_PATH];
-			strncpy(raw_path, orig_path, sizeof raw_path - 1);
-			raw_path[sizeof raw_path - 1] = '\0';
-			// Resolve to absolute for mapping and normalization
-			if (orig_path[0] == '/') pm_normalize_path_inplace(orig_path); else resolve_relative_for_pid(orig_path, sizeof orig_path, pid, AT_FDCWD);
-			char final_buf[MAX_PATH];
-			int mapped_applied = 0;
-			const char *final_path = compute_final_mapped_exec_path(orig_path, final_buf, sizeof final_buf, &mapped_applied);
-			if (mapped_applied && final_path != orig_path) {
-				// ensure actual filename arg will be remapped by existing logic; just update argv[0] using RAW original like preload
-				try_update_argv0(pid, regs, ARG_RSI, raw_path, final_path);
-			}
-		}
-		// do not return here; allow existing remap handler to run below
-	}
-	if (sysno == SYS_execveat) {
-		// (dirfd, pathname, argv, envp, flags)
-		int dirfd = (int)get_arg(regs,0);
-		unsigned long paddr = get_arg(regs,1);
-		char orig_path[MAX_PATH];
-		if (paddr && read_string(pid, paddr, orig_path, sizeof orig_path) == 0) {
-			char raw_path[MAX_PATH];
-			strncpy(raw_path, orig_path, sizeof raw_path - 1);
-			raw_path[sizeof raw_path - 1] = '\0';
-			resolve_relative_for_pid(orig_path, sizeof orig_path, pid, dirfd);
-			pm_normalize_path_inplace(orig_path);
-			char final_buf[MAX_PATH];
-			int mapped_applied = 0;
-			const char *final_path = compute_final_mapped_exec_path(orig_path, final_buf, sizeof final_buf, &mapped_applied);
-			if (mapped_applied && final_path != orig_path) {
-				try_update_argv0(pid, regs, ARG_RDX, raw_path, final_path);
-			}
-		}
-		// do not return here; allow existing remap handler to run below
-	}
 	if (sysno == SYS_truncate) { g_current_syscall = "truncate"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
 #ifdef SYS_truncate64
 	if (sysno == SYS_truncate64) { g_current_syscall = "truncate64"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RDI, AT_FDCWD); return; }
@@ -649,12 +668,13 @@ if (sysno == SYS_open_by_handle_at) { g_current_syscall = "open_by_handle_at"; r
 	if (sysno == SYS_inotify_add_watch) { g_current_syscall = "inotify_add_watch"; remap_arg_path_with_stack_fallback(pid, regs, ARG_RSI, AT_FDCWD); return; }
 #endif
 #ifdef SYS_fanotify_mark
-	if (sysno == SYS_fanotify_mark) {
-		g_current_syscall = "fanotify_mark";
-		// fanotify_mark(fd, flags, mask, dirfd, pathname)
-		remap_arg_path_with_stack_fallback(pid, regs, ARG_R10, (int)get_arg(regs,3));
-		return;
-	}
+    if (sysno == SYS_fanotify_mark) {
+        g_current_syscall = "fanotify_mark";
+        // fanotify_mark(fd, flags, mask, dirfd, pathname)
+        // On x86_64, arg4=dirfd in r10 (index 3), arg5=pathname in r8 (index 4)
+        remap_arg_path_with_stack_fallback(pid, regs, (enum arg_reg)4, (int)get_arg(regs,3));
+        return;
+    }
 #endif
 #ifdef SYS_pivot_root
 	if (sysno == SYS_pivot_root) {
@@ -763,6 +783,184 @@ if (sysno == SYS_open_by_handle_at) { g_current_syscall = "open_by_handle_at"; r
 	maybe_remap_path(pid, sysno, regs);
 }
 
+// Helpers for post-call reverse mapping
+static int read_mem(pid_t pid, unsigned long addr, void *buf, size_t len)
+{
+    struct iovec local = { .iov_base = buf, .iov_len = len };
+    struct iovec remote = { .iov_base = (void *)addr, .iov_len = len };
+    ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
+static int write_mem(pid_t pid, unsigned long addr, const void *buf, size_t len)
+{
+    if (g_config.dry_run) return 0;
+    struct iovec local = { .iov_base = (void *)buf, .iov_len = len };
+    struct iovec remote = { .iov_base = (void *)addr, .iov_len = len };
+    ssize_t n = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    return (n == (ssize_t)len) ? 0 : -1;
+}
+
+static int get_fd_dirpath_for_pid(pid_t pid, int fd, char *out, size_t out_size)
+{
+    char linkp[64];
+    snprintf(linkp, sizeof linkp, "/proc/%d/fd/%d", pid, fd);
+    ssize_t n = readlink(linkp, out, out_size - 1);
+    if (n <= 0) return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+struct linux_dirent64_local { uint64_t d_ino; int64_t d_off; unsigned short d_reclen; unsigned char d_type; char d_name[]; } __attribute__((packed));
+struct linux_dirent_local   { unsigned long d_ino; unsigned long d_off; unsigned short d_reclen; char d_name[]; } __attribute__((packed));
+
+static void reverse_readlink_post(pid_t pid, TraceRegs *regs, unsigned long pathname_addr, unsigned long buf_addr, size_t bufsiz)
+{
+    ssize_t n = (ssize_t)get_retval(regs);
+    if (!buf_addr || bufsiz == 0 || n <= 0) return;
+    // Try special-case: if pathname is /proc/*/cwd, virtualize to show virtual CWD
+    if (pathname_addr) {
+        char pbuf[MAX_PATH];
+        size_t to_read = sizeof pbuf;
+        if (read_mem(pid, pathname_addr, pbuf, to_read - 1) == 0) {
+            pbuf[to_read - 1] = '\0';
+            // Ensure null-termination
+            pbuf[strnlen(pbuf, to_read - 1)] = '\0';
+            // Read current result
+            size_t rl = (size_t)n; if (rl > bufsiz) rl = bufsiz;
+            char *tmp = (char *)malloc(bufsiz);
+            if (!tmp) return;
+            if (read_mem(pid, buf_addr, tmp, rl) == 0) {
+                ssize_t newn = pm_virtualize_proc_cwd_readlink_result(pbuf, tmp, (ssize_t)rl, bufsiz, &g_config.mapping_config);
+                if (newn != (ssize_t)rl) {
+                    size_t to_write = (size_t)newn;
+                    if (to_write > bufsiz) to_write = bufsiz;
+                    write_mem(pid, buf_addr, tmp, to_write);
+                    set_retval(regs, (unsigned long)to_write);
+                    regs_write(pid, regs);
+                    free(tmp);
+                    return;
+                }
+            }
+            free(tmp);
+        }
+    }
+    // Otherwise, apply reverse mapping when enabled
+    if (!g_config.reverse_enabled) return;
+    size_t to_read = (size_t)n; if (to_read > bufsiz) to_read = bufsiz;
+    char *tmp = (char *)malloc(bufsiz);
+    if (!tmp) return;
+    if (read_mem(pid, buf_addr, tmp, to_read) == 0) {
+        // Only reverse if the resulting absolute path lies under some TO-prefix
+        if (!pm_is_under_any_to_prefix(tmp, &g_config.mapping_config)) { free(tmp); return; }
+        ssize_t newn = pm_reverse_readlink_inplace(tmp, (ssize_t)to_read, bufsiz, &g_config.mapping_config);
+        if (newn >= 0) {
+            size_t to_write = (size_t)newn;
+            if (to_write > bufsiz) to_write = bufsiz;
+            write_mem(pid, buf_addr, tmp, to_write);
+            if ((size_t)newn != to_read) { set_retval(regs, (unsigned long)to_write); regs_write(pid, regs); }
+        }
+    }
+    free(tmp);
+}
+
+static void reverse_getdents_post(pid_t pid, TraceRegs *regs, int fd, unsigned long dirp, ssize_t n, int is64)
+{
+    if (!g_config.reverse_enabled || !dirp || n <= 0) return;
+    char *buf = (char *)malloc((size_t)n);
+    if (!buf) return;
+    if (read_mem(pid, dirp, buf, (size_t)n) != 0) { free(buf); return; }
+    char dirpath[MAX_PATH];
+    if (get_fd_dirpath_for_pid(pid, fd, dirpath, sizeof dirpath) != 0) { free(buf); return; }
+    // Only apply reverse basename mapping inside directories under some TO-prefix
+    if (!pm_is_under_any_to_prefix(dirpath, &g_config.mapping_config)) { free(buf); return; }
+    size_t off = 0;
+    if (is64) {
+        while (off + sizeof(struct linux_dirent64_local) <= (size_t)n) {
+            struct linux_dirent64_local *d = (struct linux_dirent64_local *)(buf + off);
+            if (d->d_reclen < sizeof(struct linux_dirent64_local) || off + d->d_reclen > (size_t)n) break;
+            char *name = d->d_name;
+            size_t maxname = d->d_reclen - offsetof(struct linux_dirent64_local, d_name);
+            size_t name_capacity = maxname; // reclen guarantees space within record
+            pm_reverse_basename_apply_inplace(dirpath, name, name_capacity, &g_config.mapping_config);
+            off += d->d_reclen;
+        }
+    } else {
+        while (off + sizeof(struct linux_dirent_local) <= (size_t)n) {
+            struct linux_dirent_local *d = (struct linux_dirent_local *)(buf + off);
+            if (d->d_reclen < sizeof(struct linux_dirent_local) || off + d->d_reclen > (size_t)n) break;
+            char *name = d->d_name;
+            size_t maxname = d->d_reclen - offsetof(struct linux_dirent_local, d_name);
+            size_t name_capacity = maxname;
+            pm_reverse_basename_apply_inplace(dirpath, name, name_capacity, &g_config.mapping_config);
+            off += d->d_reclen;
+        }
+    }
+    write_mem(pid, dirp, buf, (size_t)n);
+    free(buf);
+}
+
+static void reverse_getcwd_post(pid_t pid, TraceRegs *regs, unsigned long buf_addr, size_t size)
+{
+    if (!buf_addr || size == 0) return;
+    // getcwd returns pointer to buf on success; check retval
+    unsigned long ret = get_retval(regs);
+    if (ret == 0 || ret == (unsigned long)-1) return;
+    // Read existing string (up to size-1)
+    size_t to_read = size;
+    char *tmp = (char *)malloc(to_read);
+    if (!tmp) return;
+    if (read_mem(pid, buf_addr, tmp, to_read - 1) != 0) { free(tmp); return; }
+    tmp[to_read - 1] = '\0';
+    tmp[strnlen(tmp, to_read - 1)] = '\0';
+    // Apply reverse mapping to full path
+    char out[MAX_PATH];
+    // Only virtualize CWD under TO-prefixes
+    if (!pm_is_under_any_to_prefix(tmp, &g_config.mapping_config)) { free(tmp); return; }
+    const char *virt = pm_apply_reverse_mapping_with_config(tmp, out, sizeof out, &g_config.mapping_config);
+    if (virt != tmp) {
+        size_t vlen = strlen(virt);
+        if (vlen + 1 <= size) {
+            // Write back virtualized cwd
+            write_mem(pid, buf_addr, virt, vlen + 1);
+        }
+    }
+    free(tmp);
+}
+
+static void on_sys_exit(pid_t pid, TraceRegs *regs)
+{
+    long sysno = get_sysno(regs);
+    // Mark cwd fix completed after chdir returns
+    int ci = cwdfix_find(pid);
+    if (ci >= 0 && g_cwdfix_state[ci] == 1 && sysno == SYS_chdir) {
+        g_cwdfix_state[ci] = 2;
+    }
+    // Post-process readlink
+    if (sysno == SYS_readlink) {
+        reverse_readlink_post(pid, regs, get_arg(regs, 0), get_arg(regs, 1), (size_t)get_arg(regs, 2));
+        return;
+    }
+    if (sysno == SYS_readlinkat) {
+        reverse_readlink_post(pid, regs, get_arg(regs, 1), get_arg(regs, 2), (size_t)get_arg(regs, 3));
+        return;
+    }
+    if (sysno == SYS_getcwd) {
+        reverse_getcwd_post(pid, regs, get_arg(regs, 0), (size_t)get_arg(regs, 1));
+        return;
+    }
+    // Post-process getdents64
+    if (sysno == SYS_getdents64) {
+        reverse_getdents_post(pid, regs, (int)get_arg(regs,0), get_arg(regs,1), (ssize_t)get_retval(regs), 1);
+        return;
+    }
+#ifdef SYS_getdents
+    if (sysno == SYS_getdents) {
+        reverse_getdents_post(pid, regs, (int)get_arg(regs,0), get_arg(regs,1), (ssize_t)get_retval(regs), 0);
+        return;
+    }
+#endif
+}
 int main(int argc, char **argv)
 {
 	const char *cli_mapping = NULL;
@@ -787,11 +985,14 @@ int main(int argc, char **argv)
 				fprintf(stderr, "Usage: %s [OPTIONS] <command> [args...]\n\n", argv[0]);
 				fprintf(stderr, "Options:\n");
 				fprintf(stderr, "  -d, --debug            Enable debug logs\n");
-				fprintf(stderr, "  -p, --path-mapping M   Mapping 'FROM:TO[,FROM:TO...]' (overrides PATH_MAPPING)\n");
-				fprintf(stderr, "  -x, --exclude L        Comma-separated exclude prefixes (overrides PATH_MAPPING_EXCLUDE)\n");
+                fprintf(stderr, "  -p, --path-mapping M   Mapping 'FROM:TO' (',' or newlines). FROM supports * only\n");
+                fprintf(stderr, "  -x, --exclude L        Exclude list (',' or newlines). Full glob support (* ? [ ])\n");
 				fprintf(stderr, "  -r, --dry-run          Log remaps but do not modify tracee\n");
 				fprintf(stderr, "  -h, --help             Show this help\n");
 				fprintf(stderr, "  -v, --version          Show version\n");
+				fprintf(stderr, "\nGlob patterns:\n");
+				fprintf(stderr, "  Path mappings: Only * supported (FNM_PATHNAME semantics)\n");
+				fprintf(stderr, "  Exclusions: Full glob support (* ? [ ] and all standard patterns)\n");
 				return 0;
 			case 'v':
 				fprintf(stderr, "pathremap %s\n", PATHMAP_VERSION);
@@ -831,6 +1032,18 @@ int main(int argc, char **argv)
 	if (child == 0) {
 		// Make child a process group leader to receive terminal signals as foreground job
 		setpgid(0, 0);
+		// Set PWD to virtualized CWD like preload does
+		{
+			char rcwd[MAX_PATH];
+			ssize_t rn = pm_readlink_real("/proc/self/cwd", rcwd, sizeof rcwd - 1);
+			if (rn > 0) {
+				rcwd[rn] = '\0';
+				pm_normalize_path_inplace(rcwd);
+				char vbuf[MAX_PATH];
+				const char *virt = pm_virtualize_cwd_string(rcwd, vbuf, sizeof vbuf, &g_config.mapping_config);
+				if (virt && *virt) setenv("PWD", virt, 1);
+			}
+		}
 		if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
 			perror("PTRACE_TRACEME");
 			_exit(1);
@@ -927,7 +1140,11 @@ int main(int argc, char **argv)
 			tracees[idx].in_syscall ^= 1;
 			TraceRegs regs;
 			if (regs_read(pid, &regs) == -1) { goto resume; }
-			if (tracees[idx].in_syscall) on_sys_enter(pid, &regs);
+			if (tracees[idx].in_syscall) {
+				on_sys_enter(pid, &regs);
+			} else {
+				on_sys_exit(pid, &regs);
+			}
 			// regs may have been updated on exit; no need to set unless changed inside handlers
 		}
 		else {
