@@ -14,6 +14,7 @@
 #include <pwd.h>
 #include <sys/stat.h>
 #include <fnmatch.h>
+#include <errno.h>
 
 // Feature defaults (edit here to enable by default)
 // #define PM_DEFAULT_DEBUG 1
@@ -334,6 +335,14 @@ static inline void pm_load_excludes_from_env(const char *env, struct pm_mapping_
 
 static inline const char *pm_apply_mapping_with_config(const char *in, char *out, size_t out_size, const struct pm_mapping_config *config)
 {
+    // Guard against recursive mapping: if input path already contains any TO prefix, don't map it
+    for (size_t i = 0; i < config->mapping_count; i++) {
+        const char *to = config->mappings[i][1];
+        if (pm_path_prefix_matches(to, in)) {
+            return in; // Already mapped, don't map again
+        }
+    }
+    
     // Choose the best match among prefixes and globs. Prefer longer matched portion.
     ssize_t best_index = -1;
     size_t best_match_len = 0;
@@ -967,49 +976,6 @@ struct pm_cwd_plan {
     char pwd_value[MAX_PATH];
 };
 
-static inline void pm_plan_startup_cwd(const char *real_cwd,
-                                       struct pm_cwd_plan *plan,
-                                       const struct pm_mapping_config *config)
-{
-    memset(plan, 0, sizeof(*plan));
-    if (!real_cwd || !*real_cwd) return;
-    // Prefer virtual path first: chdir to its real counterpart, PWD to virtual
-    char virt_buf[MAX_PATH];
-    const char *virt = pm_virtualize_cwd_string(real_cwd, virt_buf, sizeof virt_buf, config);
-    if (virt != real_cwd) {
-        // Compute real dir to chdir: forward-map the virtual
-        char virt_real_buf[MAX_PATH];
-        const char *virt_real = pm_apply_mapping_with_config(virt, virt_real_buf, sizeof virt_real_buf, config);
-        if (virt_real == virt) {
-            // No forward mapping for the virtual path; stay in current real cwd
-            strncpy(plan->chdir_target, real_cwd, sizeof(plan->chdir_target) - 1);
-        } else {
-            strncpy(plan->chdir_target, virt_real, sizeof(plan->chdir_target) - 1);
-        }
-        strncpy(plan->pwd_value, virt, sizeof(plan->pwd_value) - 1);
-        plan->have_target = 1;
-        return;
-    }
-    // Then try forward mapping
-    char fwd_buf[MAX_PATH];
-    const char *tgt = pm_apply_mapping_with_config(real_cwd, fwd_buf, sizeof fwd_buf, config);
-    if (tgt != real_cwd) {
-        // chdir to the real target
-        strncpy(plan->chdir_target, tgt, sizeof(plan->chdir_target) - 1);
-        // PWD prefers a virtual representation of the target if available
-        const char *pv = pm_virtualize_cwd_string(tgt, plan->pwd_value, sizeof(plan->pwd_value), config);
-        if (pv == tgt) {
-            strncpy(plan->pwd_value, tgt, sizeof(plan->pwd_value) - 1);
-        }
-        plan->have_target = 1;
-        return;
-    }
-    // Fallback to root
-    strncpy(plan->chdir_target, "/", sizeof(plan->chdir_target) - 1);
-    strncpy(plan->pwd_value, "/", sizeof(plan->pwd_value) - 1);
-    plan->have_target = 1;
-}
-
 // Real stat that bypasses our interposers where relevant (for directory validation)
 static inline int pm_real_stat_is_dir(const char *path)
 {
@@ -1044,20 +1010,64 @@ static inline int pm_startup_cwd_needs_fix(const char *real_cwd, const struct pm
     return pm_real_stat_is_dir(fwd) ? 0 : 1;
 }
 
+// Helper function to set fallback to root directory
+static inline void pm_set_root_fallback(struct pm_cwd_plan *out_plan)
+{
+    strncpy(out_plan->chdir_target, "/", sizeof(out_plan->chdir_target) - 1);
+    strncpy(out_plan->pwd_value, "/", sizeof(out_plan->pwd_value) - 1);
+    out_plan->have_target = 1;
+}
+
 // Build a validated startup plan and ensure chdir_target is a real directory; fallback to "/"
 static inline void pm_build_validated_startup_cwd_plan(const char *real_cwd,
                                                        struct pm_cwd_plan *out_plan,
                                                        const struct pm_mapping_config *config)
 {
+    memset(out_plan, 0, sizeof(*out_plan));
+    
     // Respect excludes: keep current CWD and PWD as-is
     if (real_cwd && pm_is_excluded_prefix(real_cwd, config)) {
-        memset(out_plan, 0, sizeof(*out_plan));
         return;
     }
-    pm_plan_startup_cwd(real_cwd, out_plan, config);
-    if (!out_plan->have_target) return;
-    const char *t = out_plan->chdir_target;
-    if (!pm_real_stat_is_dir(t)) {
+    
+    if (!real_cwd || !*real_cwd) return;
+    
+    // Prefer virtual path first: chdir to its real counterpart, PWD to virtual
+    char virt_buf[MAX_PATH];
+    const char *virt = pm_virtualize_cwd_string(real_cwd, virt_buf, sizeof virt_buf, config);
+    if (virt != real_cwd) {
+        // Compute real dir to chdir: forward-map the virtual
+        char virt_real_buf[MAX_PATH];
+        const char *virt_real = pm_apply_mapping_with_config(virt, virt_real_buf, sizeof virt_real_buf, config);
+        if (virt_real == virt) {
+            // No forward mapping for the virtual path; stay in current real cwd
+            strncpy(out_plan->chdir_target, real_cwd, sizeof(out_plan->chdir_target) - 1);
+        } else {
+            strncpy(out_plan->chdir_target, virt_real, sizeof(out_plan->chdir_target) - 1);
+        }
+        strncpy(out_plan->pwd_value, virt, sizeof(out_plan->pwd_value) - 1);
+        out_plan->have_target = 1;
+    } else {
+        // Then try forward mapping
+        char fwd_buf[MAX_PATH];
+        const char *tgt = pm_apply_mapping_with_config(real_cwd, fwd_buf, sizeof fwd_buf, config);
+        if (tgt != real_cwd) {
+            // chdir to the real target
+            strncpy(out_plan->chdir_target, tgt, sizeof(out_plan->chdir_target) - 1);
+            // PWD prefers a virtual representation of the target if available
+            const char *pv = pm_virtualize_cwd_string(tgt, out_plan->pwd_value, sizeof(out_plan->pwd_value), config);
+            if (pv == tgt) {
+                strncpy(out_plan->pwd_value, tgt, sizeof(out_plan->pwd_value) - 1);
+            }
+            out_plan->have_target = 1;
+        } else {
+            // Fallback to root
+            pm_set_root_fallback(out_plan);
+        }
+    }
+    
+    // Validate that the target directory exists
+    if (out_plan->have_target && !pm_real_stat_is_dir(out_plan->chdir_target)) {
         // Try user's home directory before final fallback to '/'
         const char *home_env = getenv("HOME");
         char home_buf[MAX_PATH];
@@ -1076,19 +1086,25 @@ static inline void pm_build_validated_startup_cwd_plan(const char *real_cwd,
                 home = home_buf;
             }
         }
-        if (home && pm_real_stat_is_dir(home)) {
-            // chdir target is real home; PWD prefers virtualized view if available
-            strncpy(out_plan->chdir_target, home, sizeof(out_plan->chdir_target) - 1);
-            const char *pv = pm_virtualize_cwd_string(home, out_plan->pwd_value, sizeof(out_plan->pwd_value), config);
-            if (pv == home) {
-                strncpy(out_plan->pwd_value, home, sizeof(out_plan->pwd_value) - 1);
+        if (home) {
+            // Apply mapping to home directory and check if mapped version exists
+            char mapped_home[MAX_PATH];
+            const char *mapped_home_path = pm_apply_mapping_with_config(home, mapped_home, sizeof mapped_home, config);
+            if (pm_real_stat_is_dir(mapped_home_path)) {
+                // chdir target is mapped home; PWD prefers virtualized view if available
+                strncpy(out_plan->chdir_target, mapped_home_path, sizeof(out_plan->chdir_target) - 1);
+                const char *pv = pm_virtualize_cwd_string(mapped_home_path, out_plan->pwd_value, sizeof(out_plan->pwd_value), config);
+                if (pv == mapped_home_path) {
+                    strncpy(out_plan->pwd_value, mapped_home_path, sizeof(out_plan->pwd_value) - 1);
+                }
+                out_plan->have_target = 1;
+            } else {
+                // Final fallback to root
+                pm_set_root_fallback(out_plan);
             }
-            out_plan->have_target = 1;
         } else {
             // Final fallback to root
-            strncpy(out_plan->chdir_target, "/", sizeof(out_plan->chdir_target) - 1);
-            strncpy(out_plan->pwd_value, "/", sizeof(out_plan->pwd_value) - 1);
-            out_plan->have_target = 1;
+            pm_set_root_fallback(out_plan);
         }
     }
 }
@@ -1112,6 +1128,38 @@ static inline ssize_t pm_reverse_readlink_inplace(char *buf,
     size_t tocopy = vlen < bufsiz ? vlen : bufsiz;
     memcpy(buf, virt, tocopy);
     return (ssize_t)tocopy;
+}
+
+// Universal reverse mapping function that can handle both in-place and allocated string cases
+static inline char *pm_reverse_string_result(char *result,
+                                            const struct pm_mapping_config *config,
+                                            int should_free_original)
+{
+    if (result == NULL) return NULL;
+    char out[MAX_PATH];
+    const char *virt = pm_apply_reverse_mapping_with_config(result, out, sizeof out, config);
+    if (virt == result) return result; // No change needed
+    if (pm_is_excluded_prefix(virt, config)) return result; // Excluded, keep original
+    
+    // Need to create new string
+    size_t len = strlen(virt) + 1;
+    char *new_result = malloc(len);
+    if (new_result == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(new_result, virt, len);
+    if (should_free_original) {
+        free(result); // Free original
+    }
+    return new_result;
+}
+
+// Reverse-map a realpath result. Returns new string (allocated) or original if no change needed
+static inline char *pm_reverse_realpath_result(char *result,
+                                              const struct pm_mapping_config *config)
+{
+    return pm_reverse_string_result(result, config, 1); // should_free_original = 1
 }
 
 // Build full path dirpath + d_name, reverse-map, and return basename into out buffer
@@ -1330,6 +1378,9 @@ static inline int pm_execute_with_resolved_path_universal(const char *original_p
         return exec_func_without_env(final_path, argv);
     }
 }
+
+
+
 
 #endif
 

@@ -903,6 +903,9 @@ static void reverse_getdents_post(pid_t pid, TraceRegs *regs, int fd, unsigned l
 static void reverse_getcwd_post(pid_t pid, TraceRegs *regs, unsigned long buf_addr, size_t size)
 {
     if (!buf_addr || size == 0) return;
+    // Check if reverse mapping is enabled
+    if (!g_config.reverse_enabled) return;
+    
     // getcwd returns pointer to buf on success; check retval
     unsigned long ret = get_retval(regs);
     if (ret == 0 || ret == (unsigned long)-1) return;
@@ -963,6 +966,8 @@ static void on_sys_exit(pid_t pid, TraceRegs *regs)
 }
 int main(int argc, char **argv)
 {
+	// Initialize common configuration	
+	pm_init_common_config(&g_config);
 	const char *cli_mapping = NULL;
 	const char *cli_exclude = NULL;
 	static struct option longopts[] = {
@@ -977,7 +982,9 @@ int main(int argc, char **argv)
 	int opt;
 	while ((opt = getopt_long(argc, argv, "dp:x:rhv", longopts, NULL)) != -1) {
 		switch (opt) {
-			case 'd': g_config.debug = 1; break;
+			case 'd': 
+				g_config.debug = 1; 
+				break;
 			case 'p': cli_mapping = optarg; break;
 			case 'x': cli_exclude = optarg; break;
 			case 'r': g_config.dry_run = 1; break;
@@ -1002,9 +1009,6 @@ int main(int argc, char **argv)
 				return 2;
 		}
 	}
-	// Initialize common configuration
-	pm_init_common_config(&g_config);
-
 	// Override with CLI options if provided
 	if (cli_mapping && *cli_mapping) {
 		pm_load_mappings_from_env(cli_mapping, &g_config.mapping_config);

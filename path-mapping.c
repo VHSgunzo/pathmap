@@ -245,6 +245,7 @@ static const char *absolute_from_dirfd(int dirfd, const char *path, char *buffer
 #define OVERRIDE_FUNCTION_VARARGS(nargs, path_arg_pos, returntype, funcname, ...) \
     OVERRIDE_FUNCTION_MODE_GENERIC(1, nargs, path_arg_pos, returntype, funcname, __VA_ARGS__)
 
+
 #define OVERRIDE_FUNCTION_MODE_GENERIC(has_varargs, nargs, path_arg_pos, returntype, funcname, ...) \
 OVERRIDE_TYPEDEF(has_varargs, nargs, returntype, funcname, __VA_ARGS__) \
 __NL__ returntype funcname (OVERRIDE_ARGS(has_varargs, nargs, __VA_ARGS__))\
@@ -260,6 +261,7 @@ __NL__    }\
 __NL__    OVERRIDE_DO_MODE_VARARG(has_varargs, nargs, path_arg_pos, __VA_ARGS__) \
 __NL__    return orig_func(OVERRIDE_RETURN_ARGS(nargs, path_arg_pos, __VA_ARGS__));\
 __NL__}
+
 
 #define OVERRIDE_DO_MODE_VARARG(has_mode_vararg, nargs, path_arg_pos, ...) \
     OVERRIDE_DO_MODE_VARARG_##has_mode_vararg(nargs, path_arg_pos, __VA_ARGS__)
@@ -604,9 +606,68 @@ OVERRIDE_FUNCTION(2, 1, long, pathconf, const char *, path, int, name)
 
 
 #ifndef DISABLE_REALPATH
-OVERRIDE_FUNCTION(2, 1, char *, realpath, const char *, path, char *, resolved_path)
+// Custom implementation of realpath that applies reverse mapping to the result
+typedef char *(*orig_realpath_func_type)(const char *path, char *resolved_path);
+char *realpath(const char *path, char *resolved_path)
+{
+    debug_fprintf(stderr, "realpath(%s) called\n", path);
+    
+    // Apply forward mapping to input path
+    char mapped_path[MAX_PATH];
+    const char *new_path = fix_path("realpath", path, mapped_path, sizeof mapped_path);
+    
+    static orig_realpath_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_realpath_func_type)dlsym(RTLD_NEXT, "realpath");
+    }
+    
+    // Call original realpath with mapped path
+    char *result = orig_func(new_path, resolved_path);
+    if (result == NULL) return NULL;
+    
+    // Apply reverse mapping to the result
+    if (g_config.reverse_enabled) {
+        if (resolved_path != NULL) {
+            // Function provided a buffer - we cannot safely apply reverse mapping
+            // because we don't know the buffer size. Return the original result.
+            // This is the safest approach to prevent buffer overflow.
+            return result;
+        } else {
+            // realpath allocated memory, use common helper
+            return pm_reverse_realpath_result(result, &g_config.mapping_config);
+        }
+    }
+    
+    return result;
+}
+
 #ifdef __GLIBC__
-OVERRIDE_FUNCTION(1, 1, char *, canonicalize_file_name, const char *, path)
+// Custom implementation of canonicalize_file_name that applies reverse mapping to the result
+typedef char *(*orig_canonicalize_file_name_func_type)(const char *path);
+char *canonicalize_file_name(const char *path)
+{
+    debug_fprintf(stderr, "canonicalize_file_name(%s) called\n", path);
+    
+    // Apply forward mapping to input path
+    char mapped_path[MAX_PATH];
+    const char *new_path = fix_path("canonicalize_file_name", path, mapped_path, sizeof mapped_path);
+    
+    static orig_canonicalize_file_name_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_canonicalize_file_name_func_type)dlsym(RTLD_NEXT, "canonicalize_file_name");
+    }
+    
+    // Call original canonicalize_file_name with mapped path
+    char *result = orig_func(new_path);
+    if (result == NULL) return NULL;
+    
+    // Apply reverse mapping to the result
+    if (g_config.reverse_enabled) {
+        return pm_reverse_realpath_result(result, &g_config.mapping_config);
+    }
+    
+    return result;
+}
 #endif
 #endif // DISABLE_REALPATH
 
@@ -903,7 +964,9 @@ OVERRIDE_FUNCTION(2, 1, int, mkfifo, const char *, filename, mode_t, mode)
 
 
 #ifndef DISABLE_CREAT
-// mk*temp family (template is a path-like string)
+// mk*temp family (template is a path-like string) - use standard macro for safety
+// Note: We cannot safely apply reverse mapping to in-place results because we don't know
+// the actual buffer size. Forward mapping still works correctly.
 OVERRIDE_FUNCTION(1, 1, int, mkstemp, char *, template)
 OVERRIDE_FUNCTION(2, 1, int, mkostemp, char *, template, int, flags)
 OVERRIDE_FUNCTION(2, 1, int, mkstemps, char *, template, int, suffixlen)

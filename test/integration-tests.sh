@@ -362,6 +362,49 @@ test_realpath_preload() {
 # realpath(): ensure reverse returns virtual path (tracer)
 ## Tracer does not hook realpath directly; covered by readlink -f tests
 
+# realpath(): test with buffer (preload)
+test_realpath_buffer_preload() {
+    setup
+    PATH_MAPPING="$PATH_MAPPING" LD_PRELOAD="$lib" \
+        "$testdir/testtool-realpath" "$testdir/virtual/dir1/dir2/../file1" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    # With buffer: should return real path (for memory safety)
+    grep -q "realpath with buffer: $testdir/real/dir1/file1" out/${FUNCNAME[0]}
+    # With NULL: should return virtual path (reverse mapping works)
+    grep -q "realpath with NULL: $testdir/virtual/dir1/file1" out/${FUNCNAME[0]}
+}
+
+# realpath(): test with buffer (tracer)
+test_realpath_buffer_tracer() {
+    setup
+    PATH_MAPPING="$PATH_MAPPING" "$project_root/pathmap" \
+        "$testdir/testtool-realpath" "$testdir/virtual/dir1/dir2/../file1" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    # Tracer applies reverse mapping to both cases (no memory safety issues)
+    grep -q "realpath with buffer: $testdir/virtual/dir1/file1" out/${FUNCNAME[0]}
+    grep -q "realpath with NULL: $testdir/virtual/dir1/file1" out/${FUNCNAME[0]}
+}
+
+# canonicalize_file_name(): test (preload)
+test_canonicalize_preload() {
+    setup
+    PATH_MAPPING="$PATH_MAPPING" LD_PRELOAD="$lib" \
+        "$testdir/testtool-canonicalize" "$testdir/virtual/dir1/dir2/../file1" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    # Should return virtual path
+    grep -q "canonicalize_file_name: $testdir/virtual/dir1/file1" out/${FUNCNAME[0]}
+}
+
+# canonicalize_file_name(): test (tracer)
+test_canonicalize_tracer() {
+    setup
+    PATH_MAPPING="$PATH_MAPPING" "$project_root/pathmap" \
+        "$testdir/testtool-canonicalize" "$testdir/virtual/dir1/dir2/../file1" \
+        >out/${FUNCNAME[0]} 2>out/${FUNCNAME[0]}.err
+    # Should return virtual path
+    grep -q "canonicalize_file_name: $testdir/virtual/dir1/file1" out/${FUNCNAME[0]}
+}
+
 # glob expansion in shell should list virtual entries (preload)
 test_glob_preload() {
     setup

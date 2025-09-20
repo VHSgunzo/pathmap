@@ -16,13 +16,13 @@ path-mapping-glibc.so: path-mapping.c
 path-mapping-musl.so: path-mapping.c
 	musl-gcc $(CFLAGS) -shared -fPIC -Os -g0 -s path-mapping.c -o $@ -ldl
 
-all: path-mapping.so pathmap pathmap-static
+all: path-mapping.so
 
 clean:
 	rm -f *.so pathmap pathmap-static*
 	rm -rf $(TESTDIR)
 
-test: all unit_tests testtools
+test: path-mapping.so pathmap unit_tests testtools
 	for f in $(UNIT_TESTS); do $(TESTDIR)/$$f; done
 	TESTDIR="$(TESTDIR)" test/integration-tests.sh
 
