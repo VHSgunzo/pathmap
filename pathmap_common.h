@@ -85,13 +85,72 @@ static inline int pm_capture_stars(const char *pattern,
             pp += litlen;
         }
         if (*pp == '*') {
-            // capture up to next '/'
-            const char *seg_end = strchr(sp, '/');
-            size_t seglen = seg_end ? (size_t)(seg_end - sp) : strlen(sp);
-            if (cap_index < maxcaps) { caps[cap_index] = sp; caplens[cap_index] = seglen; }
-            cap_index++;
-            sp += seglen;
             pp++; // skip '*'
+            // Find what comes after '*' in pattern
+            if (*pp == '\0') {
+                // '*' at end: capture everything to end of path
+                size_t seglen = strlen(sp);
+                if (cap_index < maxcaps) { caps[cap_index] = sp; caplens[cap_index] = seglen; }
+                cap_index++;
+                sp += seglen;
+            } else if (*pp == '/') {
+                // '*' before '/': capture up to next '/' (single segment)
+                const char *seg_end = strchr(sp, '/');
+                if (!seg_end) return -1; // must have '/' in path
+                size_t seglen = (size_t)(seg_end - sp);
+                if (cap_index < maxcaps) { caps[cap_index] = sp; caplens[cap_index] = seglen; }
+                cap_index++;
+                sp += seglen;
+            } else {
+                // '*' before literal: find where literal starts in path
+                // Find length of literal (until next '*' or '/')
+                const char *literal_start = pp;
+                size_t literal_len = 0;
+                const char *next_aster = strchr(pp, '*');
+                const char *next_slash = strchr(pp, '/');
+                // Literal ends at next '*' or '/' or end of pattern
+                const char *literal_end = pp;
+                if (next_aster && next_slash) {
+                    literal_end = (next_aster < next_slash) ? next_aster : next_slash;
+                } else if (next_aster) {
+                    literal_end = next_aster;
+                } else if (next_slash) {
+                    literal_end = next_slash;
+                } else {
+                    literal_end = pp + strlen(pp);
+                }
+                literal_len = (size_t)(literal_end - pp);
+                
+                // Search for literal in remaining path (greedy: find last occurrence if multiple)
+                const char *found = NULL;
+                // Try to find the literal, but respect segment boundaries
+                // If literal contains '/', we can search anywhere; otherwise search within current segment
+                if (memchr(literal_start, '/', literal_len) != NULL) {
+                    // Literal contains '/': search from current position
+                    size_t path_remaining = strlen(sp);
+                    for (const char *search = sp; search + literal_len <= sp + path_remaining; search++) {
+                        if (memcmp(search, literal_start, literal_len) == 0) {
+                            found = search;
+                        }
+                    }
+                } else {
+                    // Literal doesn't contain '/': search within current segment (until next '/' or end)
+                    const char *seg_end = strchr(sp, '/');
+                    size_t seg_remaining = seg_end ? (size_t)(seg_end - sp) : strlen(sp);
+                    // Find last occurrence of literal within segment
+                    for (const char *search = sp; search + literal_len <= sp + seg_remaining; search++) {
+                        if (memcmp(search, literal_start, literal_len) == 0) {
+                            found = search;
+                        }
+                    }
+                }
+                if (!found) return -1; // literal not found
+                // Capture everything before the literal
+                size_t seglen = (size_t)(found - sp);
+                if (cap_index < maxcaps) { caps[cap_index] = sp; caplens[cap_index] = seglen; }
+                cap_index++;
+                sp = found; // sp points to literal; it will be advanced by literal matching in next iteration
+            }
         }
     }
     // After pattern end, path must also end
@@ -360,16 +419,32 @@ static inline const char *pm_apply_mapping_with_config(const char *in, char *out
             if (aster && strchr(aster + 1, '*') == NULL && strchr(from, '?') == NULL && strchr(from, '[') == NULL) {
                 size_t pref_len = (size_t)(aster - from);
                 if (strncmp(from, in, pref_len) == 0) {
-                    // Ensure boundary at dir separator or exact end
-                    if (pref_len == 0 || from[pref_len - 1] == '/' ) {
-                        size_t match_len = pref_len;
-                        if (match_len >= best_match_len) {
-                            best_match_len = match_len;
-                            best_index = (ssize_t)i;
-                            best_from_len = pref_len;
-                            best_tail = in + pref_len;
-                            best_has_captured_tail = 1;
-                        }
+                    // Relaxed: accept prefix match even if not ending with '/'
+                    const char *captured_start = in + pref_len;
+                    size_t captured_len;
+                    if (aster[1] == '\0') {
+                        // '*' at end: capture everything to end of input path
+                        captured_len = strlen(captured_start);
+                    } else if (aster[1] == '/') {
+                        // '*' before '/': capture only until next '/'
+                        const char *next_slash = strchr(captured_start, '/');
+                        captured_len = next_slash ? (size_t)(next_slash - captured_start) : strlen(captured_start);
+                    } else {
+                        // '*' followed by literal: capture within current segment until next '/'
+                        const char *next_slash = strchr(captured_start, '/');
+                        captured_len = next_slash ? (size_t)(next_slash - captured_start) : strlen(captured_start);
+                    }
+                    size_t match_len = pref_len;
+                    if (match_len >= best_match_len) {
+                        best_match_len = match_len;
+                        best_index = (ssize_t)i;
+                        best_from_len = pref_len;
+                        best_tail = captured_start;
+                        best_has_captured_tail = 1;
+                        // Provide one capture for substitution in TO
+                        best_capcount = 1;
+                        best_caps[0] = captured_start;
+                        best_caplens[0] = captured_len;
                     }
                 }
             } else {
@@ -420,18 +495,34 @@ static inline const char *pm_apply_mapping_with_config(const char *in, char *out
             int capi = 0;
             while (to[i_to] != '\0') {
                 if (to[i_to] == '*' && capi < best_capcount) {
-                    // Separator handling
+                    // Check what comes after '*' in TO pattern
+                    int after_star_is_slash = (to[i_to + 1] == '/');
+                    int after_star_is_end = (to[i_to + 1] == '\0');
+                    
+                    // Add separator before capture only if needed (when at segment boundary)
                     if (pos > 0 && out[pos - 1] != '/' && best_caps[capi][0] != '/') {
-                        if (pos + 1 >= out_size) return in; 
-                        out[pos++] = '/';
+                        // Only add separator if '*' is at a segment boundary (before '/')
+                        if (i_to > 0 && to[i_to - 1] == '/') {
+                            if (pos + 1 >= out_size) return in; 
+                            out[pos++] = '/';
+                        }
                     }
+                    
+                    // Insert captured content
                     if (pos + best_caplens[capi] >= out_size) return in;
                     memcpy(out + pos, best_caps[capi], best_caplens[capi]); pos += best_caplens[capi];
-                    i_to++;
-                    // Add sep between capture and next literal if needed
-                    if (to[i_to] != '\0' && to[i_to] != '/' && pos > 0 && out[pos - 1] != '/') {
-                        if (pos + 1 >= out_size) return in; 
-                        out[pos++] = '/';
+                    i_to++; // skip '*'
+                    
+                    // If '*' was followed by '/' in pattern, add separator and skip it in pattern
+                    // For literals after '*', just skip '*' and continue normally (no separator)
+                    if (after_star_is_slash) {
+                        // Add '/' after captured part if needed
+                        if (pos > 0 && out[pos - 1] != '/') {
+                            if (pos + 1 >= out_size) return in;
+                            out[pos++] = '/';
+                        }
+                        // Skip the '/' in pattern since we already added it
+                        i_to++;
                     }
                     capi++;
                     continue;
@@ -821,6 +912,9 @@ static inline const char *pm_apply_reverse_mapping_with_config(const char *in,
                                                              size_t out_size,
                                                              const struct pm_mapping_config *config)
 {
+    if (!in || !*in) return in;
+    if (out_size < 2) return in;
+    
     // Prefer the most specific match. Support TO-globs with star captures.
     ssize_t best_index = -1;
     size_t best_score = 0; // longer match wins

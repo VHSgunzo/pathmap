@@ -99,8 +99,11 @@ Defaults apply if not set: `/etc/passwd,/etc/group,/etc/nsswitch.conf`.
 **In Path Mappings (FROM patterns):**
 - ✅ **`*` (asterisk)**: Supported with FNM_PATHNAME semantics
   - Matches any characters within a single path segment (doesn't cross `/` boundaries)
+  - When `*` is followed by a literal (e.g., `*.mo`), it captures everything before that literal within the segment
+  - When `*` is at the end of a pattern, it captures everything to the end of the input path (can span multiple segments)
   - Supports capture groups for substitution in TO patterns
   - Multiple `*` patterns are supported
+  - Can match partial filenames (e.g., `qemu*` matches `qemu-system-x86_64`, `*.mo` matches files with `.mo` extension)
 - ❌ **`?` (question mark)**: Not supported
 - ❌ **`[ ]` (character classes)**: Not supported
 
@@ -119,6 +122,30 @@ PATH_MAPPING="/usr/share/locale/*:/tmp/AppDir/usr/share/locale/*"
 # ✅ Multiple asterisks - captures multiple segments
 PATH_MAPPING="/usr/share/locale/*/*/app.mo:/tmp/AppDir/usr/share/locale/*/*/app.mo"
 # Maps: /usr/share/locale/en/LC_MESSAGES/app.mo -> /tmp/AppDir/usr/share/locale/en/LC_MESSAGES/app.mo
+
+# ✅ Partial filename matching with extension - captures prefix before extension
+PATH_MAPPING="/usr/share/locale/*/*/*.mo:/tmp/AppDir/usr/share/locale/*/*/*.mo"
+# Maps: /usr/share/locale/en/LC_MESSAGES/zenity.mo -> /tmp/AppDir/usr/share/locale/en/LC_MESSAGES/zenity.mo
+# First '*' captures "en", second '*' captures "LC_MESSAGES", third '*' captures "zenity" (before .mo extension)
+
+# ✅ Partial filename matching - captures suffix after prefix in filename
+PATH_MAPPING="/usr/bin/qemu*:/tmp/qemu*"
+# Maps: /usr/bin/qemu-system-x86_64 -> /tmp/qemu-system-x86_64
+# Maps: /usr/bin/qemu-img -> /tmp/qemu-img
+# The '*' captures everything after "qemu" in the filename and substitutes it in the target pattern
+
+# ✅ Partial filename matching with multiple patterns
+PATH_MAPPING="/usr/share/locale/en/*/app*:/tmp/AppDir/usr/share/locale/en/*/zenity*"
+# Maps: /usr/share/locale/en/LC_MESSAGES/app.mo -> /tmp/AppDir/usr/share/locale/en/LC_MESSAGES/zenity.mo
+# First '*' captures "LC_MESSAGES", second '*' captures ".mo"
+
+# ✅ Multiple paths mapping to a single fixed target (no '*' in TO pattern)
+PATH_MAPPING="/usr/*/qemu*:/tmp/qemu-system-x86_64"
+# Maps: /usr/bin/qemu-system-i386 -> /tmp/qemu-system-x86_64
+# Maps: /usr/bin/qemu-img -> /tmp/qemu-system-x86_64
+# Maps: /usr/sbin/qemu-nbd -> /tmp/qemu-system-x86_64
+# When TO pattern has no '*', captured parts are ignored and all matching paths map to the same fixed target
+# Note: The '*' matches only a single path segment, so /usr/local/bin/qemu* would require a different pattern like /usr/*/bin/qemu* or /usr/*/*/qemu*
 
 # ❌ These will NOT work as glob patterns (treated as literal paths):
 PATH_MAPPING="/usr/share/locale/??/LC_MESSAGES:/tmp/AppDir/usr/share/locale/??/LC_MESSAGES"
