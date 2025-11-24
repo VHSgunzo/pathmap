@@ -331,6 +331,41 @@ int openat64(int dirfd, const char *pathname, int flags, ...)
     }
     return orig_func(dirfd, new_path, flags);
 }
+
+// Fortified versions used by libstdc++
+typedef int (*orig___openat_2_func_type)(int dirfd, const char *pathname, int flags);
+int __openat_2(int dirfd, const char *pathname, int flags)
+{
+    debug_fprintf(stderr, "__openat_2(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__openat_2", abs, buffer, sizeof buffer);
+
+    static orig___openat_2_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___openat_2_func_type)dlsym(RTLD_NEXT, "__openat_2");
+    }
+
+    return orig_func(dirfd, new_path, flags);
+}
+
+typedef int (*orig___openat64_2_func_type)(int dirfd, const char *pathname, int flags);
+int __openat64_2(int dirfd, const char *pathname, int flags)
+{
+    debug_fprintf(stderr, "__openat64_2(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__openat64_2", abs, buffer, sizeof buffer);
+
+    static orig___openat64_2_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___openat64_2_func_type)dlsym(RTLD_NEXT, "__openat64_2");
+    }
+
+    return orig_func(dirfd, new_path, flags);
+}
 #endif
 #endif // DISABLE_OPENAT
 
@@ -359,6 +394,35 @@ OVERRIDE_FUNCTION(2, 1, FILE*, fopen, const char *, filename, const char *, mode
 OVERRIDE_FUNCTION(2, 1, FILE*, fopen64, const char *, filename, const char *, mode)
 #endif
 OVERRIDE_FUNCTION(3, 1, FILE*, freopen, const char *, filename, const char *, mode, FILE *, stream)
+
+#ifdef __GLIBC__
+// Fortified variants for fopen
+typedef FILE *(*orig___fopen_chk_func_type)(const char *filename, const char *mode, int flags);
+FILE *__fopen_chk(const char *filename, const char *mode, int flags)
+{
+    debug_fprintf(stderr, "__fopen_chk(%s) called\n", filename);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fopen_chk", filename, buffer, sizeof buffer);
+    static orig___fopen_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fopen_chk_func_type)dlsym(RTLD_NEXT, "__fopen_chk");
+    }
+    return orig_func(new_path, mode, flags);
+}
+
+typedef FILE *(*orig___fopen64_chk_func_type)(const char *filename, const char *mode, int flags);
+FILE *__fopen64_chk(const char *filename, const char *mode, int flags)
+{
+    debug_fprintf(stderr, "__fopen64_chk(%s) called\n", filename);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fopen64_chk", filename, buffer, sizeof buffer);
+    static orig___fopen64_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fopen64_chk_func_type)dlsym(RTLD_NEXT, "__fopen64_chk");
+    }
+    return orig_func(new_path, mode, flags);
+}
+#endif
 #endif // DISABLE_FOPEN
 
 
@@ -452,6 +516,37 @@ int __fxstatat64(int ver, int dirfd, const char *pathname, struct stat64 *statbu
     static orig___fxstatat64_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig___fxstatat64_func_type)dlsym(RTLD_NEXT, "__fxstatat64");
+    }
+    return orig_func(ver, dirfd, new_path, statbuf, flags);
+}
+
+// Fortified _2 variants for fstatat
+typedef int (*orig___fxstatat_2_func_type)(int ver, int dirfd, const char *pathname, struct stat *statbuf, int flags);
+int __fxstatat_2(int ver, int dirfd, const char *pathname, struct stat *statbuf, int flags)
+{
+    debug_fprintf(stderr, "__fxstatat_2(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fxstatat_2", abs, buffer, sizeof buffer);
+    static orig___fxstatat_2_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fxstatat_2_func_type)dlsym(RTLD_NEXT, "__fxstatat_2");
+    }
+    return orig_func(ver, dirfd, new_path, statbuf, flags);
+}
+
+typedef int (*orig___fxstatat64_2_func_type)(int ver, int dirfd, const char *pathname, struct stat64 *statbuf, int flags);
+int __fxstatat64_2(int ver, int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
+{
+    debug_fprintf(stderr, "__fxstatat64_2(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("__fxstatat64_2", abs, buffer, sizeof buffer);
+    static orig___fxstatat64_2_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___fxstatat64_2_func_type)dlsym(RTLD_NEXT, "__fxstatat64_2");
     }
     return orig_func(ver, dirfd, new_path, statbuf, flags);
 }
@@ -611,20 +706,20 @@ typedef char *(*orig_realpath_func_type)(const char *path, char *resolved_path);
 char *realpath(const char *path, char *resolved_path)
 {
     debug_fprintf(stderr, "realpath(%s) called\n", path);
-    
+
     // Apply forward mapping to input path
     char mapped_path[MAX_PATH];
     const char *new_path = fix_path("realpath", path, mapped_path, sizeof mapped_path);
-    
+
     static orig_realpath_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_realpath_func_type)dlsym(RTLD_NEXT, "realpath");
     }
-    
+
     // Call original realpath with mapped path
     char *result = orig_func(new_path, resolved_path);
     if (result == NULL) return NULL;
-    
+
     // Apply reverse mapping to the result
     if (g_config.reverse_enabled) {
         if (resolved_path != NULL) {
@@ -637,7 +732,7 @@ char *realpath(const char *path, char *resolved_path)
             return pm_reverse_realpath_result(result, &g_config.mapping_config);
         }
     }
-    
+
     return result;
 }
 
@@ -647,23 +742,54 @@ typedef char *(*orig_canonicalize_file_name_func_type)(const char *path);
 char *canonicalize_file_name(const char *path)
 {
     debug_fprintf(stderr, "canonicalize_file_name(%s) called\n", path);
-    
+
     // Apply forward mapping to input path
     char mapped_path[MAX_PATH];
     const char *new_path = fix_path("canonicalize_file_name", path, mapped_path, sizeof mapped_path);
-    
+
     static orig_canonicalize_file_name_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig_canonicalize_file_name_func_type)dlsym(RTLD_NEXT, "canonicalize_file_name");
     }
-    
+
     // Call original canonicalize_file_name with mapped path
     char *result = orig_func(new_path);
+    if (result == NULL) return NULL;
+
+    // Apply reverse mapping to the result
+    if (g_config.reverse_enabled) {
+        return pm_reverse_realpath_result(result, &g_config.mapping_config);
+    }
+
+    return result;
+}
+
+// Fortified variant for realpath
+typedef char *(*orig___realpath_chk_func_type)(const char *path, char *resolved_path, size_t resolved_len);
+char *__realpath_chk(const char *path, char *resolved_path, size_t resolved_len)
+{
+    debug_fprintf(stderr, "__realpath_chk(%s) called\n", path);
+    
+    // Apply forward mapping to input path
+    char mapped_path[MAX_PATH];
+    const char *new_path = fix_path("__realpath_chk", path, mapped_path, sizeof mapped_path);
+    
+    static orig___realpath_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___realpath_chk_func_type)dlsym(RTLD_NEXT, "__realpath_chk");
+    }
+    
+    // Call original __realpath_chk with mapped path
+    char *result = orig_func(new_path, resolved_path, resolved_len);
     if (result == NULL) return NULL;
     
     // Apply reverse mapping to the result
     if (g_config.reverse_enabled) {
-        return pm_reverse_realpath_result(result, &g_config.mapping_config);
+        if (resolved_path != NULL) {
+            return result;
+        } else {
+            return pm_reverse_realpath_result(result, &g_config.mapping_config);
+        }
     }
     
     return result;
@@ -746,6 +872,35 @@ char *getwd(char *buf)
     memcpy(buf, final_str, need);
     return buf;
 }
+
+// Fortified variants for getcwd
+typedef char *(*orig___getcwd_chk_func_type)(char *buf, size_t size, size_t buflen);
+char *__getcwd_chk(char *buf, size_t size, size_t buflen)
+{
+    debug_fprintf(stderr, "__getcwd_chk() called\n");
+    static orig___getcwd_chk_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig___getcwd_chk_func_type)dlsym(RTLD_NEXT, "__getcwd_chk");
+    }
+    // First, get the real CWD from libc
+    char tmp_real[MAX_PATH];
+    char *real_ptr = orig_func(tmp_real, sizeof tmp_real, sizeof tmp_real);
+    if (real_ptr == NULL) return NULL;
+    // Compute preferred virtual path (reverse mapping)
+    char vbuf[MAX_PATH];
+    const char *virt = pm_apply_reverse_mapping_with_config(real_ptr, vbuf, sizeof vbuf, &g_config.mapping_config);
+    const char *final_str = (virt != real_ptr) ? virt : real_ptr;
+    size_t need = strlen(final_str) + 1;
+    if (buf == NULL) {
+        char *out = (char *)malloc(need);
+        if (!out) { errno = ENOMEM; return NULL; }
+        memcpy(out, final_str, need);
+        return out;
+    }
+    if (size == 0 || need > size || need > buflen) { errno = ERANGE; return NULL; }
+    memcpy(buf, final_str, need);
+    return buf;
+}
 #endif // __GLIBC__
 #endif // DISABLE_CHDIR
 
@@ -801,18 +956,6 @@ ssize_t __readlink_chk(const char *pathname, char *buf, size_t bufsiz, size_t bu
     static orig___readlink_chk_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig___readlink_chk_func_type)dlsym(RTLD_NEXT, "__readlink_chk");
-        if (orig_func == NULL) {
-            // Fallback to plain readlink if fortified symbol not found
-            orig_readlink_func_type f = (orig_readlink_func_type)dlsym(RTLD_NEXT, "readlink");
-            if (!f) return -1;
-            ssize_t n = f(in, buf, bufsiz);
-            if (g_config.reverse_enabled) {
-                ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
-                if (nv != n) return nv;
-                return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
-            }
-            return n;
-        }
     }
     ssize_t n = orig_func(in, buf, bufsiz, buflen);
     if (g_config.reverse_enabled) {
@@ -834,17 +977,6 @@ ssize_t __readlinkat_chk(int dirfd, const char *pathname, char *buf, size_t bufs
     static orig___readlinkat_chk_func_type orig_func = NULL;
     if (orig_func == NULL) {
         orig_func = (orig___readlinkat_chk_func_type)dlsym(RTLD_NEXT, "__readlinkat_chk");
-        if (orig_func == NULL) {
-            orig_readlinkat_func_type f = (orig_readlinkat_func_type)dlsym(RTLD_NEXT, "readlinkat");
-            if (!f) return -1;
-            ssize_t n = f(dirfd, in, buf, bufsiz);
-            if (g_config.reverse_enabled) {
-                ssize_t nv = pm_virtualize_proc_cwd_readlink_result(in, buf, n, bufsiz, &g_config.mapping_config);
-                if (nv != n) return nv;
-                return pm_reverse_readlink_inplace(buf, n, bufsiz, &g_config.mapping_config);
-            }
-            return n;
-        }
     }
     ssize_t n = orig_func(dirfd, in, buf, bufsiz, buflen);
     if (g_config.reverse_enabled) {
@@ -981,12 +1113,38 @@ OVERRIDE_FUNCTION(3, 1, int, mknod, const char *, filename, mode_t, mode, dev_t,
 
 
 #ifndef DISABLE_MKFIFO
-OVERRIDE_FUNCTION(3, 2, int, mkfifoat, int, dirfd, const char *, pathname, mode_t, mode)
+typedef int (*orig_mkfifoat_func_type)(int dirfd, const char *pathname, mode_t mode);
+int mkfifoat(int dirfd, const char *pathname, mode_t mode)
+{
+    debug_fprintf(stderr, "mkfifoat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("mkfifoat", abs, buffer, sizeof buffer);
+    static orig_mkfifoat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_mkfifoat_func_type)dlsym(RTLD_NEXT, "mkfifoat");
+    }
+    return orig_func(dirfd, new_path, mode);
+}
 #endif // DISABLE_MKFIFO
 
 
 #ifndef DISABLE_MKNOD
-OVERRIDE_FUNCTION(4, 2, int, mknodat, int, dirfd, const char *, pathname, mode_t, mode, dev_t, dev)
+typedef int (*orig_mknodat_func_type)(int dirfd, const char *pathname, mode_t mode, dev_t dev);
+int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev)
+{
+    debug_fprintf(stderr, "mknodat(%s) called\n", pathname);
+    char absbuf[MAX_PATH];
+    const char *abs = absolute_from_dirfd(dirfd, pathname, absbuf, sizeof absbuf);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("mknodat", abs, buffer, sizeof buffer);
+    static orig_mknodat_func_type orig_func = NULL;
+    if (orig_func == NULL) {
+        orig_func = (orig_mknodat_func_type)dlsym(RTLD_NEXT, "mknodat");
+    }
+    return orig_func(dirfd, new_path, mode, dev);
+}
 #endif // DISABLE_MKNOD
 
 
