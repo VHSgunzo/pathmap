@@ -32,7 +32,7 @@ struct mount_attr;
 #include <errno.h> // errno, ERANGE
 #include <sys/inotify.h>
 #include <sys/fanotify.h> // fanotify_mark
-
+#include <sys/syscall.h> // syscall(SYS_*)
 
 // Use common logging system from pathmap_common.h
 #define info_fprintf pm_info_fprintf
@@ -44,6 +44,7 @@ struct mount_attr;
 // #define DISABLE_OPENAT
 // #define DISABLE_FOPEN
 // #define DISABLE_CHDIR
+// #define DISABLE_CHROOT
 // #define DISABLE_STAT
 // #define DISABLE_FSTATAT
 // #define DISABLE_STATFS
@@ -434,13 +435,38 @@ OVERRIDE_FUNCTION(2, 1, int, creat64, const char *, pathname, mode_t, mode)
 
 
 #ifndef DISABLE_CHDIR
-OVERRIDE_FUNCTION(1, 1, int, chdir, const char *, path)
+// vfork/zygote-safe chdir: direct syscall
+int chdir(const char *path)
+{
+    debug_fprintf(stderr, "chdir(%s) called\n", path);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("chdir", path, buffer, sizeof buffer);
+#ifdef SYS_chdir
+    return (int)syscall(SYS_chdir, new_path);
+#else
+    // Should not happen on Linux; keep errno consistent
+    errno = ENOSYS;
+    return -1;
+#endif
+}
 #endif // DISABLE_CHDIR
 
 
-#ifndef DISABLE_CHDIR
-OVERRIDE_FUNCTION(1, 1, int, chroot, const char *, path)
-#endif // DISABLE_CHDIR
+#ifndef DISABLE_CHROOT
+// vfork/zygote-safe chroot: direct syscall
+int chroot(const char *path)
+{
+    debug_fprintf(stderr, "chroot(%s) called\n", path);
+    char buffer[MAX_PATH];
+    const char *new_path = fix_path("chroot", path, buffer, sizeof buffer);
+#ifdef SYS_chroot
+    return (int)syscall(SYS_chroot, new_path);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+#endif // DISABLE_CHROOT
 
 
 #ifndef DISABLE_STAT

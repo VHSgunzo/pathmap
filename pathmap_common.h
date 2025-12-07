@@ -213,6 +213,15 @@ static inline const char *pm_apply_mapping_pairs(const char *in,
     return in;
 }
 
+// Helper: trim leading/trailing spaces and tabs in-place
+static inline char *pm_trim_ws(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+    *e = '\0';
+    return s;
+}
+
 static inline int pm_parse_path_mapping_env(const char *env,
                                            char ***linear_pairs_out, // array of 2*N char* entries
                                            int *pairs_len_out,
@@ -238,14 +247,6 @@ static inline int pm_parse_path_mapping_env(const char *env,
     int idx = 0;
     char *pair_start = buf;
     size_t buf_len = strlen(buf);
-    // Helper: trim leading/trailing spaces and tabs in-place
-    auto char *pm_trim_ws(char *s) {
-        while (*s == ' ' || *s == '\t') s++;
-        char *e = s + strlen(s);
-        while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
-        *e = '\0';
-        return s;
-    }
     for (size_t i = 0; i <= buf_len; i++) {
         if (buf[i] == ',' || buf[i] == '\n' || buf[i] == '\r' || buf[i] == '\0') {
             buf[i] = '\0'; // terminate current pair
