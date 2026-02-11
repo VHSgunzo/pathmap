@@ -372,8 +372,8 @@ int __openat64_2(int dirfd, const char *pathname, int flags)
 
 
 #ifndef DISABLE_OPENAT2
-typedef int (*orig_openat2_func_type)(int dirfd, const char *pathname, struct open_how *how, size_t size);
-int openat2(int dirfd, const char *pathname, struct open_how *how, size_t size)
+typedef int (*orig_openat2_func_type)(int dirfd, const char *pathname, const struct open_how *how, size_t size);
+int openat2(int dirfd, const char *pathname, const struct open_how *how, size_t size)
 {
     debug_fprintf(stderr, "openat2(%s) called\n", pathname);
     char absbuf[MAX_PATH];
